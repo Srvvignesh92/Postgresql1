@@ -1,0 +1,48 @@
+SELECT 
+    n.nspname AS owner,
+    CASE 
+        WHEN c.relkind = 'r' THEN 'TABLE'
+        WHEN c.relkind = 'v' THEN 'VIEW'
+        WHEN c.relkind = 'i' THEN 'INDEX'
+        WHEN c.relkind = 'S' THEN 'SEQUENCE'
+        WHEN c.relkind = 'f' THEN 'FOREIGN TABLE'
+        WHEN c.relkind = 'p' THEN 'PARTITIONED TABLE'
+        WHEN t.typtype = 'c' THEN 'TYPE'
+        WHEN pg_proc.proname IS NOT NULL THEN 
+            CASE 
+                WHEN pg_proc.prokind = 'f' THEN 'FUNCTION'
+                WHEN pg_proc.prokind = 'p' THEN 'PROCEDURE'
+                WHEN pg_proc.prokind = 'a' THEN 'AGGREGATE'
+            END
+    END AS object_type,
+    COUNT(1) AS count
+FROM 
+    pg_catalog.pg_namespace n
+LEFT JOIN 
+    pg_catalog.pg_class c ON n.oid = c.relnamespace
+LEFT JOIN 
+    pg_catalog.pg_type t ON n.oid = t.typnamespace AND t.typtype = 'c'
+LEFT JOIN 
+    pg_catalog.pg_proc ON n.oid = pg_proc.pronamespace
+WHERE 
+    n.nspname NOT IN ('pg_catalog', 'information_schema')
+    AND n.nspname !~ '^pg_toast'
+GROUP BY 
+    n.nspname,
+    CASE 
+        WHEN c.relkind = 'r' THEN 'TABLE'
+        WHEN c.relkind = 'v' THEN 'VIEW'
+        WHEN c.relkind = 'i' THEN 'INDEX'
+        WHEN c.relkind = 'S' THEN 'SEQUENCE'
+        WHEN c.relkind = 'f' THEN 'FOREIGN TABLE'
+        WHEN c.relkind = 'p' THEN 'PARTITIONED TABLE'
+        WHEN t.typtype = 'c' THEN 'TYPE'
+        WHEN pg_proc.proname IS NOT NULL THEN 
+            CASE 
+                WHEN pg_proc.prokind = 'f' THEN 'FUNCTION'
+                WHEN pg_proc.prokind = 'p' THEN 'PROCEDURE'
+                WHEN pg_proc.prokind = 'a' THEN 'AGGREGATE'
+            END
+    END
+ORDER BY 
+    n.nspname, object_type;
