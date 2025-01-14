@@ -1,52 +1,62 @@
-CREATE OR REPLACE PROCEDURE GET_TABLE_COLUMNS
-AS
-    CURSOR column_cursor IS
-        SELECT owner, table_name, column_name, data_type
-        FROM all_tab_columns
-        WHERE data_type NOT IN ('LONG', 'CLOB', 'DATE', 'TIMESTAMP')
-        ORDER BY owner, table_name, column_name;
+-- Check all roles and their attributes
+SELECT rolname AS role_name,
+       rolsuper AS is_superuser,
+       rolinherit AS can_inherit,
+       rolcreaterole AS can_create_role,
+       rolcreatedb AS can_create_db,
+       rolcanlogin AS can_login,
+       rolreplication AS can_replication,
+       rolbypassrls AS bypasses_rls
+FROM pg_roles;
 
-    -- Variable to hold cursor data
-    column_rec column_cursor%ROWTYPE;
+-- Check role memberships
+SELECT roleid::regrole AS member,
+       member::regrole AS belongs_to,
+       grantor::regrole AS granted_by,
+       admin_option
+FROM pg_auth_members;
 
-    -- Variable to hold dynamic SQL
-    v_sql VARCHAR2(1000);
+-- Check privileges on schemas
+SELECT grantee,
+       privilege_type,
+       table_schema
+FROM information_schema.role_schema_grants
+WHERE grantee = 'your_user_or_role'; -- Replace with the role name you are querying
 
-    -- Variable to hold the count of rows
-    v_row_count NUMBER;
-BEGIN
-    -- Loop through each column from the cursor
-    FOR column_rec IN column_cursor LOOP
-        BEGIN
-            -- Construct the dynamic SQL query
-            v_sql := 'SELECT COUNT(*) FROM ' || column_rec.owner || '.' || column_rec.table_name || 
-                     ' WHERE ' || column_rec.column_name || ' IS NOT NULL';
+-- Check privileges on tables
+SELECT grantee,
+       privilege_type,
+       table_schema,
+       table_name
+FROM information_schema.role_table_grants
+WHERE grantee = 'your_user_or_role'; -- Replace with the role name you are querying
 
-            -- Execute the query and store the result in v_row_count
-            EXECUTE IMMEDIATE v_sql INTO v_row_count;
+-- Check privileges on sequences
+SELECT grantee,
+       privilege_type,
+       sequence_schema,
+       sequence_name
+FROM information_schema.role_sequence_grants
+WHERE grantee = 'your_user_or_role'; -- Replace with the role name you are querying
 
-            -- Check the count and take appropriate action
-            IF v_row_count > 1 THEN
-                -- Insert into the staging table
-                INSERT INTO staging_table (owner, table_name, record_count)
-                VALUES (column_rec.owner, column_rec.table_name, v_row_count);
+-- Check privileges on functions
+SELECT grantee,
+       privilege_type,
+       specific_schema,
+       routine_name
+FROM information_schema.role_routine_grants
+WHERE grantee = 'your_user_or_role'; -- Replace with the role name you are querying
 
-                -- Optional: Log a message for successful insert
-                DBMS_OUTPUT.PUT_LINE('Inserted into staging: Owner: ' || column_rec.owner || 
-                                     ', Table: ' || column_rec.table_name || 
-                                     ', Non-NULL Rows: ' || v_row_count);
-            ELSIF v_row_count = 0 THEN
-                -- Log a message that no rows were observed
-                DBMS_OUTPUT.PUT_LINE('No rows observed for Table: ' || column_rec.owner || '.' || column_rec.table_name);
-            END IF;
+-- Check privileges on databases
+SELECT datname AS database_name,
+       pg_catalog.pg_get_userbyid(datdba) AS owner,
+       has_database_privilege(datname, 'CONNECT') AS can_connect,
+       has_database_privilege(datname, 'TEMP') AS can_temp
+FROM pg_database;
 
-        EXCEPTION
-            WHEN OTHERS THEN
-                -- Handle exceptions, e.g., if the table does not exist or is inaccessible
-                DBMS_OUTPUT.PUT_LINE('Error processing Table: ' || column_rec.table_name || 
-                                     ', Column: ' || column_rec.column_name || 
-                                     ' - ' || SQLERRM);
-        END;
-    END LOOP;
-END GET_TABLE_COLUMNS;
-/
+-- Check all default privileges for a user or role
+SELECT defaclrole::regrole AS role_name,
+       defaclnamespace::regnamespace AS schema_name,
+       defaclobjtype AS object_type,
+       defaclacl AS default_privileges
+FROM pg_default_acl;
