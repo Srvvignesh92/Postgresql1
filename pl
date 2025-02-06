@@ -60,3 +60,15 @@ SELECT defaclrole::regrole AS role_name,
        defaclobjtype AS object_type,
        defaclacl AS default_privileges
 FROM pg_default_acl;
+
+
+-- check partiton and record count:
+
+SELECT 
+    inhrelid::regclass AS partition_name, 
+    reltuples::bigint AS estimated_row_count
+FROM pg_inherits
+JOIN pg_class c ON inhrelid = c.oid
+JOIN pg_stat_user_tables s ON inhrelid = s.relid
+WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'application')
+ORDER BY partition_name;
