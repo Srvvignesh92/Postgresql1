@@ -1,3 +1,7 @@
+https://www.interdb.jp/pg/pgsql11.html
+
+https://edu.postgrespro.com/postgresql_internals-14_part1_en.pdf
+
 -- Check all roles and their attributes
 SELECT rolname AS role_name,
        rolsuper AS is_superuser,
