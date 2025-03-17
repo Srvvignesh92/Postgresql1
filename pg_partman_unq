@@ -1,0 +1,72 @@
+-- drop table public.order cascade;
+-- drop table public.order_template; 
+-- truncate table partman.part_config cascade;
+
+
+CREATE TABLE IF NOT EXISTS public."order"
+(
+    id bigint NOT NULL,
+    order_data character varying(20) COLLATE pg_catalog."default",
+    order_time timestamp with time zone NOT NULL,
+    CONSTRAINT order_pk PRIMARY KEY (id, order_time)
+) PARTITION BY RANGE (order_time);
+
+CREATE TABLE IF NOT EXISTS public."order_child"
+(
+    id_c bigint NOT NULL,
+    order_data_c character varying(20) COLLATE pg_catalog."default",
+    order_time_c timestamp with time zone NOT NULL,
+    CONSTRAINT order_c_pk PRIMARY KEY (id_c, order_time_c),
+	CONSTRAINT order_c_fk FOREIGN KEY (id_c,order_time_c) REFERENCES public.order(id,order_time)
+) PARTITION BY RANGE (order_time_c);
+
+
+create table public.order_template (like public.order including all);
+alter table public.order_template add constraint unq1 unique(id);
+
+create table public.order_c_template (like public.order_child including all);
+alter table public.order_c_template add constraint unq1_c unique(id_c);
+
+SELECT partman.create_parent(
+    p_parent_table => 'public.order',
+    p_control => 'order_time',
+    p_type => 'range',
+    p_interval => '1 month',
+	p_template_table => 'public.order_template',
+	p_premake => 3
+);
+
+
+SELECT partman.create_parent(
+    p_parent_table => 'public.order_child',
+    p_control => 'order_time_c',
+    p_type => 'range',
+    p_interval => '1 month',
+	p_template_table => 'public.order_c_template',
+	p_premake => 3
+);
+
+UPDATE partman.part_config
+SET premake = 6  -- Change to desired number
+WHERE parent_table = 'public.order';
+
+
+SELECT partman.run_maintenance('public.order');
+select * from partman.part_config;
+
+INSERT INTO my_table (event_time) 
+VALUES ('2024-03-17 12:30:45+05:30');  -- Specifying IST (Indian Standard Time)
+
+insert into public.order values (1,'data1','2025-03-17 12:30:45+05:30');
+insert into public.order values (2,'data1','2025-03-17 13:30:45+05:30');
+insert into public.order values (3,'data1','2025-03-17 13:30:45+05:30');
+
+insert into public.order values (3,'data1','2025-04-17 13:30:45+05:30');
+insert into public.order values (4,'data1','2025-04-17 14:30:45+05:30');
+insert into public.order values (5,'data1','2025-04-17 14:30:45+05:30');
+
+insert into public.order_child values (2,'data1','2025-03-17 13:30:45+05:30');
+
+
+select * from public.order;
+select * from public.order_child;
