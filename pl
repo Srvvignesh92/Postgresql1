@@ -76,3 +76,10 @@ JOIN pg_class c ON inhrelid = c.oid
 JOIN pg_stat_user_tables s ON inhrelid = s.relid
 WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'application')
 ORDER BY partition_name;
+
+-- performance 
+
+    SET LOCAL max_parallel_workers_per_gather = 4;
+    SET LOCAL max_parallel_workers = 8;
+    SET LOCAL parallel_setup_cost = 0.1;
+    SET LOCAL parallel_tuple_cost = 0.1;
