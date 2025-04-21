@@ -83,3 +83,86 @@ ORDER BY partition_name;
     SET LOCAL max_parallel_workers = 8;
     SET LOCAL parallel_setup_cost = 0.1;
     SET LOCAL parallel_tuple_cost = 0.1;
+
+-- to pick the index scan 
+
+SET enable_seqscan = off;
+EXPLAIN ANALYZE
+SELECT * FROM your_table WHERE some_column = 'some_value';
+
+-- to enable the disk access 
+
+SET random_page_cost = 1.1;
+SET seq_page_cost = 0.5;
+
+-- To check vacuum 
+
+SELECT 
+  relname AS table_name,
+  last_vacuum,
+  last_autovacuum,
+  last_analyze,
+  last_autoanalyze
+FROM pg_stat_user_tables
+WHERE relname IN ('table_a', 'table_b'); -- Specify your table names
+
+-- pg_stat_statement 
+
+SELECT 
+  query,
+  total_exec_time,
+  calls,
+  mean_exec_time,
+  max_exec_time,
+  min_exec_time,
+  rows,
+  shared_blks_hit,
+  shared_blks_read,
+  shared_blks_written,
+  temp_blks_read,
+  temp_blks_written,
+  blk_read_time,
+  blk_write_time
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 10;
+
+
+-- Find slow queries with high disk usage:
+
+SELECT 
+  query, 
+  total_exec_time, 
+  calls, 
+  mean_exec_time, 
+  blk_read_time, 
+  blk_write_time
+FROM pg_stat_statements
+WHERE blk_read_time > 1000 -- Adjust based on threshold
+ORDER BY total_exec_time DESC;
+
+--Top queries by execution time:
+
+SELECT query, total_exec_time
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 10;
+
+--Most frequently executed queries:
+
+SELECT query, calls
+FROM pg_stat_statements
+ORDER BY calls DESC
+LIMIT 10;
+
+-- parallelism
+
+SET max_parallel_workers_per_gather = 4; -- Example: Allow up to 4 workers for a query
+SET parallel_tuple_cost = 0.1; -- Lowering this may trigger more parallelism
+SET parallel_setup_cost = 1000; -- Adjust as necessary
+SET max_parallel_workers = 8; -- Allow up to 8 parallel workers for the entire system
+
+
+
+
+    
