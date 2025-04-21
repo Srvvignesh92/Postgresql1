@@ -1,0 +1,95 @@
+-- powershell script calling 
+
+Start-Job -ScriptBlock {
+    psql -h your-host -U user -d dbname -c "PERFORM your_func();"
+}
+
+
+-- with parameters and func to choose the procs based on the condition 
+
+# Define connection details
+$host = "your-host-name"
+$port = "5432"
+$db = "your-db-name"
+$user = "your-username"
+
+# Read the parameters from CSV
+$functionParams = Import-Csv -Path "C:\path\to\function_parameters.csv"
+
+# Loop through each row and run the function in parallel
+foreach ($param in $functionParams) {
+    # Convert StartDate to DateTime object for comparison
+    $startDate = [DateTime]::Parse($param.StartDate)
+
+    # Determine the function to use based on the year of StartDate
+    if ($startDate.Year -ge 2023) {
+        # Use function 1 and 2 for dates >= 2023
+        $sql1 = "PERFORM $($param.FunctionName)('$($param.StartDate)', '$($param.EndDate)');"
+        Start-Job -ScriptBlock {
+            param ($sql, $host, $port, $db, $user)
+            psql -h $host -p $port -U $user -d $db -c $sql
+        } -ArgumentList $sql1, $host, $port, $db, $user
+    } else {
+        # Use function 3 and 4 for dates < 2023
+        $sql2 = "PERFORM $($param.FunctionName)('$($param.StartDate)', '$($param.EndDate)');"
+        Start-Job -ScriptBlock {
+            param ($sql, $host, $port, $db, $user)
+            psql -h $host -p $port -U $user -d $db -c $sql
+        } -ArgumentList $sql2, $host, $port, $db, $user
+    }
+}
+
+# Wait for all jobs to complete
+Get-Job | Wait-Job
+
+# Retrieve output from all jobs
+Get-Job | Receive-Job
+
+# Clean up jobs
+Get-Job | Remove-Job
+
+
+-- python script ---
+
+import subprocess
+import concurrent.futures
+import os
+
+# === CONFIGURE THESE ===
+psql_path = r'C:\Program Files\PostgreSQL\15\bin\psql.exe'  # Update if needed
+host = 'your-cluster-endpoint.amazonaws.com'
+port = '5432'
+user = 'your_user'
+dbname = 'your_db'
+password = 'your_password'
+
+# === Function calls ===
+functions = [
+    "SELECT migrate_data_range_1();",
+    "SELECT migrate_data_range_2();",
+    "SELECT migrate_data_range_3();",
+    "SELECT migrate_data_range_4();"
+]
+
+def run_function(sql):
+    command = [
+        psql_path,
+        f"--host={host}",
+        f"--port={port}",
+        f"--username={user}",
+        f"--dbname={dbname}",
+        "-c", sql
+    ]
+
+    env = os.environ.copy()
+    env["PGPASSWORD"] = password  # Use environment var for password
+
+    try:
+        result = subprocess.run(command, env=env, capture_output=True, text=True, check=True)
+        print(f"\n[SUCCESS] {sql.strip()}\n{result.stdout}")
+    except subprocess.CalledProcessError as e:
+        print(f"\n[ERROR] {sql.strip()}\n{e.stderr}")
+
+if __name__ == "__main__":
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        executor.map(run_function, functions)
