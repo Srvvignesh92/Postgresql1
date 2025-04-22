@@ -105,3 +105,53 @@ def run_function(sql):
 if __name__ == "__main__":
     with concurrent.futures.ThreadPoolExecutor() as executor:
         executor.map(run_function, functions)
+
+
+---
+
+CREATE OR REPLACE PROCEDURE run_migration()
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    start_time TIMESTAMP;
+    end_time TIMESTAMP;
+BEGIN
+    -- Function 1
+    start_time := NOW();
+    RAISE NOTICE 'Function 1 Start Time: %', start_time;
+
+    PERFORM function_1();  -- Replace with actual function call
+
+    end_time := NOW();
+    RAISE NOTICE 'Function 1 End Time: %', end_time;
+
+    -- Function 2
+    start_time := NOW();
+    RAISE NOTICE 'Function 2 Start Time: %', start_time;
+
+    PERFORM function_2();
+
+    end_time := NOW();
+    RAISE NOTICE 'Function 2 End Time: %', end_time;
+
+    -- Function 3
+    start_time := NOW();
+    RAISE NOTICE 'Function 3 Start Time: %', start_time;
+
+    PERFORM function_3();
+
+    end_time := NOW();
+    RAISE NOTICE 'Function 3 End Time: %', end_time;
+
+    -- Function 4
+    start_time := NOW();
+    RAISE NOTICE 'Function 4 Start Time: %', start_time;
+
+    PERFORM function_4();
+
+    end_time := NOW();
+    RAISE NOTICE 'Function 4 End Time: %', end_time;
+
+END;
+$$;
+
