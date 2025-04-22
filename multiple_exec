@@ -109,49 +109,45 @@ if __name__ == "__main__":
 
 ---
 
-CREATE OR REPLACE PROCEDURE run_migration()
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    start_time TIMESTAMP;
-    end_time TIMESTAMP;
-BEGIN
-    -- Function 1
-    start_time := NOW();
-    RAISE NOTICE 'Function 1 Start Time: %', start_time;
+# Define connection info (except password)
+$psqlPath = "C:\Users\Administrator\AppData\Local\Programs\pgAdmin 4\runtime\psql.exe"
+$host = "your-db-hostname"
+$db = "your-db-name"
+$user = "postgres"
 
-    PERFORM function_1();  -- Replace with actual function call
+# Prompt for password securely
+$securePwd = Read-Host "Enter PostgreSQL password" -AsSecureString
+$pwd = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePwd))
 
-    end_time := NOW();
-    RAISE NOTICE 'Function 1 End Time: %', end_time;
+# Ask user how many fund types they want to run
+[int]$count = Read-Host "Enter number of fund types to process"
+$fundTypes = @()
 
-    -- Function 2
-    start_time := NOW();
-    RAISE NOTICE 'Function 2 Start Time: %', start_time;
+for ($i = 1; $i -le $count; $i++) {
+    $fund = Read-Host "Enter fund type #$i"
+    $fundTypes += $fund
+}
 
-    PERFORM function_2();
+# Create logs directory
+$logDir = "$PWD\logs"
+if (-not (Test-Path $logDir)) {
+    New-Item -Path $logDir -ItemType Directory
+}
 
-    end_time := NOW();
-    RAISE NOTICE 'Function 2 End Time: %', end_time;
+# Launch background jobs for each fund type
+foreach ($fund in $fundTypes) {
+    $logFile = "$logDir\job_$fund.txt"
+    $query = "CALL process_fund_data('$fund');"
 
-    -- Function 3
-    start_time := NOW();
-    RAISE NOTICE 'Function 3 Start Time: %', start_time;
+    Start-Job -ScriptBlock {
+        param($psqlPath, $host, $db, $user, $pwd, $query, $logFile)
 
-    PERFORM function_3();
+        $env:PGPASSWORD = $pwd
+        & $psqlPath -h $host -d $db -U $user -c $query *>&1 | Out-File -FilePath $logFile -Encoding utf8
 
-    end_time := NOW();
-    RAISE NOTICE 'Function 3 End Time: %', end_time;
+    } -ArgumentList $psqlPath, $host, $db, $user, $pwd, $query, $logFile
+}
 
-    -- Function 4
-    start_time := NOW();
-    RAISE NOTICE 'Function 4 Start Time: %', start_time;
+Write-Host "`nStarted $($fundTypes.Count) background jobs. Logs are saved in: $logDir"
 
-    PERFORM function_4();
-
-    end_time := NOW();
-    RAISE NOTICE 'Function 4 End Time: %', end_time;
-
-END;
-$$;
 
