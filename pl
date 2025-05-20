@@ -166,27 +166,32 @@ SET max_parallel_workers = 8; -- Allow up to 8 parallel workers for the entire s
 
 -- join
 
--- Assuming temp_result has: id, max_h_id, min_h_id, c_id, some_column
 
-INSERT INTO temp_result (id, max_h_id, min_h_id, c_id, some_column)
+
+-- Assuming temp_result has: id, max_h_id, min_h_id, o_data, c_data
+
+INSERT INTO temp_result (id, max_h_id, min_h_id, o_data, c_data)
 SELECT
   a.id,
-  b.h_id AS max_h_id,
+  max_tbl.max_h_id,
   min_tbl.min_h_id,
-  b.c_id,
-  c.some_column
-FROM tb1 a
-JOIN tb2 b ON a.id = b.id
+  o_row.o_data,
+  c_row.c_data
+FROM a
 JOIN (
     SELECT id, MAX(h_id) AS max_h_id
-    FROM tb2
+    FROM b
     GROUP BY id
-) AS max_tbl ON b.id = max_tbl.id AND b.h_id = max_tbl.max_h_id
+) AS max_tbl ON a.id = max_tbl.id
 JOIN (
     SELECT id, MIN(h_id) AS min_h_id
-    FROM tb2
+    FROM b
     GROUP BY id
-) AS min_tbl ON b.id = min_tbl.id
-JOIN tb3 c ON b.c_id = c.c_id;
+) AS min_tbl ON a.id = min_tbl.id
+-- Get o_data for min_h_id
+JOIN b o_row ON a.id = o_row.id AND o_row.h_id = min_tbl.min_h_id
+-- Get c_data for max_h_id
+JOIN b c_row ON a.id = c_row.id AND c_row.h_id = max_tbl.max_h_id;
+
 
     
