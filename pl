@@ -193,5 +193,142 @@ JOIN b o_row ON a.id = o_row.id AND o_row.h_id = min_tbl.min_h_id
 -- Get c_data for max_h_id
 JOIN b c_row ON a.id = c_row.id AND c_row.h_id = max_tbl.max_h_id;
 
+-- index _ fk disable - enable 
+
+CREATE SCHEMA IF NOT EXISTS migration_helper;
+
+CREATE TABLE migration_helper.maintenance_metadata (
+    object_type TEXT,           -- 'INDEX' or 'FK'
+    table_schema TEXT,
+    table_name TEXT,
+    object_name TEXT,
+    ddl TEXT,
+    created_at TIMESTAMP DEFAULT now()
+);
+
+CREATE OR REPLACE PROCEDURE migration_helper.drop_constraints_and_indexes(p_schema TEXT, p_tables TEXT[])
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    t TEXT;
+    idx RECORD;
+    fk RECORD;
+    idx_count INT;
+    fk_count INT;
+    start_time TIMESTAMP;
+    end_time TIMESTAMP;
+BEGIN
+    start_time := clock_timestamp();
+
+    FOREACH t IN ARRAY p_tables
+    LOOP
+        idx_count := 0;
+        fk_count := 0;
+
+        FOR idx IN
+            SELECT indexname, indexdef
+            FROM pg_indexes
+            WHERE schemaname = p_schema
+              AND tablename = t
+              AND indexname NOT IN (
+                  SELECT conname FROM pg_constraint
+                  WHERE contype IN ('p', 'u') AND conrelid = format('%I.%I', p_schema, t)::regclass
+              )
+        LOOP
+            INSERT INTO migration_helper.maintenance_metadata(object_type, table_schema, table_name, object_name, ddl)
+            VALUES ('INDEX', p_schema, t, idx.indexname, idx.indexdef);
+
+            EXECUTE format('DROP INDEX IF EXISTS %I.%I', p_schema, idx.indexname);
+            idx_count := idx_count + 1;
+        END LOOP;
+
+        FOR fk IN
+            SELECT conname, pg_get_constraintdef(c.oid) AS ddl
+            FROM pg_constraint c
+            JOIN pg_class rel ON rel.oid = c.conrelid
+            JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+            WHERE c.contype = 'f'
+              AND nsp.nspname = p_schema
+              AND rel.relname = t
+        LOOP
+            INSERT INTO migration_helper.maintenance_metadata(object_type, table_schema, table_name, object_name, ddl)
+            VALUES ('FK', p_schema, t, fk.conname, fk.ddl);
+
+            EXECUTE format('ALTER TABLE %I.%I DROP CONSTRAINT %I', p_schema, t, fk.conname);
+            fk_count := fk_count + 1;
+        END LOOP;
+
+        RAISE NOTICE 'Table: % - Dropped Indexes: %, Dropped FKs: %', t, idx_count, fk_count;
+    END LOOP;
+
+    end_time := clock_timestamp();
+    RAISE NOTICE '⏱ Drop Phase Completed in: % seconds', round(EXTRACT(EPOCH FROM end_time - start_time), 2);
+END;
+$$;
+
+
+CREATE OR REPLACE PROCEDURE migration_helper.recreate_constraints_and_indexes(p_schema TEXT, p_tables TEXT[])
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    t TEXT;
+    rec RECORD;
+    idx_count INT;
+    fk_count INT;
+    total_expected INT;
+    total_restored INT;
+    start_time TIMESTAMP;
+    end_time TIMESTAMP;
+BEGIN
+    start_time := clock_timestamp();
+    total_restored := 0;
+
+    FOREACH t IN ARRAY p_tables
+    LOOP
+        idx_count := 0;
+        fk_count := 0;
+
+        FOR rec IN
+            SELECT * FROM migration_helper.maintenance_metadata
+            WHERE table_schema = p_schema AND table_name = t
+            ORDER BY created_at
+        LOOP
+            IF rec.object_type = 'INDEX' THEN
+                EXECUTE rec.ddl;
+                idx_count := idx_count + 1;
+            ELSIF rec.object_type = 'FK' THEN
+                EXECUTE format('ALTER TABLE %I.%I ADD CONSTRAINT %I %s',
+                               rec.table_schema, rec.table_name, rec.object_name, rec.ddl);
+                fk_count := fk_count + 1;
+            END IF;
+
+            total_restored := total_restored + 1;
+        END LOOP;
+
+        RAISE NOTICE 'Table: % - Recreated Indexes: %, Recreated FKs: %', t, idx_count, fk_count;
+    END LOOP;
+
+    total_expected := (
+        SELECT COUNT(*) FROM migration_helper.maintenance_metadata
+        WHERE table_schema = p_schema AND table_name = ANY(p_tables)
+    );
+
+    IF total_restored = total_expected THEN
+        RAISE NOTICE '✅ All constraints and indexes successfully restored.';
+    ELSE
+        RAISE WARNING '⚠️ Restored %, but expected % from metadata.', total_restored, total_expected;
+    END IF;
+
+    DELETE FROM migration_helper.maintenance_metadata
+    WHERE table_schema = p_schema AND table_name = ANY(p_tables);
+
+    end_time := clock_timestamp();
+    RAISE NOTICE '⏱ Restore Phase Completed in: % seconds', round(EXTRACT(EPOCH FROM end_time - start_time), 2);
+END;
+$$;
+
+
+CALL migration_helper.drop_constraints_and_indexes('application', ARRAY['orders', 'customers']);
+CALL migration_helper.recreate_constraints_and_indexes('application', ARRAY['orders', 'customers']);
 
     
