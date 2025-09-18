@@ -331,4 +331,291 @@ $$;
 CALL migration_helper.drop_constraints_and_indexes('application', ARRAY['orders', 'customers']);
 CALL migration_helper.recreate_constraints_and_indexes('application', ARRAY['orders', 'customers']);
 
+
+
+
+
+    ---
+
+
+    -- Check if any constraints are invalid (should return 0 rows if all are valid)
+SELECT 
+    n.nspname AS schema_name,
+    c.relname AS table_name,
+    con.conname AS constraint_name,
+    con.contype AS constraint_type,
+    con.convalidated AS is_validated
+FROM pg_constraint con
+JOIN pg_class c ON con.conrelid = c.oid
+JOIN pg_namespace n ON c.relnamespace = n.oid
+WHERE con.convalidated = false  -- Invalid constraints
+  AND n.nspname NOT IN ('information_schema', 'pg_catalog')
+ORDER BY n.nspname, c.relname, con.conname;
+
+--
+
+-- Detailed FK constraint status check
+SELECT 
+    n.nspname AS schema_name,
+    c.relname AS table_name,
+    con.conname AS constraint_name,
+    con.contype AS constraint_type,
+    CASE con.contype
+        WHEN 'f' THEN 'FOREIGN KEY'
+        WHEN 'p' THEN 'PRIMARY KEY'  
+        WHEN 'u' THEN 'UNIQUE'
+        WHEN 'c' THEN 'CHECK'
+        WHEN 'x' THEN 'EXCLUDE'
+        ELSE con.contype::text
+    END AS constraint_description,
+    con.convalidated AS is_validated,
+    CASE 
+        WHEN con.convalidated THEN '✅ VALID'
+        ELSE '❌ INVALID - NEEDS VALIDATION'
+    END AS status,
+    pg_get_constraintdef(con.oid) AS constraint_definition
+FROM pg_constraint con
+JOIN pg_class c ON con.conrelid = c.oid
+JOIN pg_namespace n ON c.relnamespace = n.oid
+WHERE con.contype = 'f'  -- Only foreign keys
+  AND n.nspname NOT IN ('information_schema', 'pg_catalog')
+ORDER BY 
+    n.nspname, 
+    c.relname, 
+    con.convalidated,  -- Invalid ones first
+    con.conname;
+
+    --
+
+
+
+    -- Check constraints on partitioned tables and their partitions
+WITH partition_info AS (
+    SELECT 
+        schemaname,
+        tablename,
+        CASE 
+            WHEN schemaname||'.'||tablename IN (
+                SELECT schemaname||'.'||partitiontablename 
+                FROM pg_partitions
+            ) THEN 'PARTITION'
+            WHEN schemaname||'.'||tablename IN (
+                SELECT schemaname||'.'||tablename 
+                FROM pg_partitions
+            ) THEN 'PARENT'
+            ELSE 'REGULAR'
+        END AS table_type
+    FROM pg_tables
+    WHERE schemaname NOT IN ('information_schema', 'pg_catalog')
+)
+SELECT 
+    pi.table_type,
+    n.nspname AS schema_name,
+    c.relname AS table_name,
+    con.conname AS constraint_name,
+    con.contype AS constraint_type,
+    con.convalidated AS is_validated,
+    CASE 
+        WHEN con.convalidated THEN '✅ VALID'
+        ELSE '❌ INVALID'
+    END AS validation_status,
+    pg_get_constraintdef(con.oid) AS constraint_definition
+FROM pg_constraint con
+JOIN pg_class c ON con.conrelid = c.oid
+JOIN pg_namespace n ON c.relnamespace = n.oid
+LEFT JOIN partition_info pi ON pi.schemaname = n.nspname AND pi.tablename = c.relname
+WHERE con.contype IN ('f', 'c', 'u', 'p')  -- All constraint types
+  AND n.nspname NOT IN ('information_schema', 'pg_catalog')
+ORDER BY 
+    pi.table_type,
+    n.nspname, 
+    c.relname,
+    con.convalidated,  -- Show invalid ones first
+    con.conname;
+
+    -- 
+
+
+    -- Check constraints between specific parent and child tables
+-- Replace 'your_parent_table' and 'your_child_table' with actual names
+
+SELECT 
+    'PARENT TABLE' AS table_role,
+    n.nspname AS schema_name,
+    c.relname AS table_name,
+    con.conname AS constraint_name,
+    con.convalidated AS is_validated,
+    pg_get_constraintdef(con.oid) AS constraint_definition
+FROM pg_constraint con
+JOIN pg_class c ON con.conrelid = c.oid  
+JOIN pg_namespace n ON c.relnamespace = n.oid
+WHERE c.relname = 'your_parent_table'  -- Replace with your parent table
+  AND con.contype = 'f'
+
+UNION ALL
+
+SELECT 
+    'CHILD TABLE' AS table_role,
+    n.nspname AS schema_name, 
+    c.relname AS table_name,
+    con.conname AS constraint_name,
+    con.convalidated AS is_validated,
+    pg_get_constraintdef(con.oid) AS constraint_definition
+FROM pg_constraint con
+JOIN pg_class c ON con.conrelid = c.oid
+JOIN pg_namespace n ON c.relnamespace = n.oid  
+WHERE c.relname LIKE 'your_child_table%'  -- Pattern match for partitions
+  AND con.contype = 'f'
+ORDER BY table_role, table_name, constraint_name;
+
+-- 
+
+
+Index - 
+
+-- Check for invalid indexes (should return 0 rows if all are healthy)
+SELECT 
+    schemaname,
+    tablename,
+    indexname,
+    indexdef,
+    CASE 
+        WHEN indisvalid THEN '✅ VALID'
+        ELSE '❌ INVALID - NEEDS REBUILD'
+    END AS index_status
+FROM pg_indexes pi
+JOIN pg_class c ON pi.indexname = c.relname
+JOIN pg_index i ON c.oid = i.indexrelid
+WHERE NOT indisvalid  -- Only invalid indexes
+  AND schemaname NOT IN ('information_schema', 'pg_catalog')
+ORDER BY schemaname, tablename, indexname;
+
+--
+
+
+-- Comprehensive index status for all tables
+SELECT 
+    pi.schemaname,
+    pi.tablename,
+    pi.indexname,
+    CASE 
+        WHEN i.indisunique THEN 'UNIQUE'
+        WHEN i.indisprimary THEN 'PRIMARY KEY'
+        WHEN array_length(i.indkey, 1) = 1 THEN 'SINGLE COLUMN'
+        ELSE 'MULTI COLUMN'
+    END AS index_type,
+    CASE 
+        WHEN i.indisvalid THEN '✅ VALID'
+        ELSE '❌ INVALID'
+    END AS validity_status,
+    CASE 
+        WHEN i.indisready THEN '✅ READY'
+        ELSE '❌ NOT READY'
+    END AS ready_status,
+    pg_size_pretty(pg_relation_size(c.oid)) AS index_size,
+    pg_stat_get_tuples_returned(c.oid) AS times_used,
+    pg_stat_get_tuples_fetched(c.oid) AS tuples_fetched,
+    pi.indexdef AS index_definition
+FROM pg_indexes pi
+JOIN pg_class c ON pi.indexname = c.relname
+JOIN pg_index i ON c.oid = i.indexrelid
+JOIN pg_stat_user_indexes psui ON psui.indexrelid = c.oid
+WHERE pi.schemaname NOT IN ('information_schema', 'pg_catalog')
+ORDER BY 
+    pi.schemaname, 
+    pi.tablename,
+    CASE WHEN i.indisvalid THEN 1 ELSE 0 END,  -- Invalid indexes first
+    pi.indexname;
+
+    ----
+
+
+    -- Index usage statistics to identify unused indexes
+SELECT 
+    schemaname,
+    tablename,
+    indexname,
+    idx_scan AS times_used,
+    idx_tup_read AS tuples_read,
+    idx_tup_fetch AS tuples_fetched,
+    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
+    CASE 
+        WHEN idx_scan = 0 THEN '⚠️ UNUSED INDEX'
+        WHEN idx_scan < 100 THEN '🔸 LOW USAGE'
+        WHEN idx_scan < 1000 THEN '🔹 MODERATE USAGE'
+        ELSE '✅ HIGH USAGE'
+    END AS usage_level,
+    pg_stat_get_tuples_returned(indexrelid) AS index_scans
+FROM pg_stat_user_indexes
+WHERE schemaname NOT IN ('information_schema', 'pg_catalog')
+ORDER BY 
+    schemaname, 
+    tablename,
+    idx_scan ASC;  -- Unused indexes first
+
+    --
+
+
+    -- Index status specifically for partitioned tables and their partitions
+WITH partition_hierarchy AS (
+    SELECT 
+        schemaname,
+        tablename,
+        'PARENT' as table_type
+    FROM pg_tables pt
+    WHERE EXISTS (
+        SELECT 1 FROM pg_partitioned_table ppt 
+        JOIN pg_class pc ON ppt.partrelid = pc.oid
+        JOIN pg_namespace pn ON pc.relnamespace = pn.oid
+        WHERE pn.nspname = pt.schemaname AND pc.relname = pt.tablename
+    )
     
+    UNION ALL
+    
+    SELECT 
+        schemaname,
+        tablename,
+        'PARTITION' as table_type
+    FROM pg_tables pt
+    WHERE EXISTS (
+        SELECT 1 FROM pg_inherits pi
+        JOIN pg_class child ON pi.inhrelid = child.oid
+        JOIN pg_namespace child_ns ON child.relnamespace = child_ns.oid
+        WHERE child_ns.nspname = pt.schemaname AND child.relname = pt.tablename
+    )
+)
+SELECT 
+    ph.table_type,
+    pi.schemaname,
+    pi.tablename,
+    pi.indexname,
+    CASE 
+        WHEN i.indisvalid THEN '✅ VALID'
+        ELSE '❌ INVALID'
+    END AS validity_status,
+    CASE 
+        WHEN i.indisready THEN '✅ READY'
+        ELSE '❌ BUILDING'
+    END AS ready_status,
+    CASE 
+        WHEN i.indisprimary THEN 'PRIMARY KEY'
+        WHEN i.indisunique THEN 'UNIQUE'
+        WHEN i.indisexclusion THEN 'EXCLUSION'
+        ELSE 'REGULAR'
+    END AS index_type,
+    pg_size_pretty(pg_relation_size(c.oid)) AS index_size,
+    psi.idx_scan AS usage_count,
+    pi.indexdef
+FROM partition_hierarchy ph
+JOIN pg_indexes pi ON ph.schemaname = pi.schemaname AND ph.tablename = pi.tablename
+JOIN pg_class c ON pi.indexname = c.relname
+JOIN pg_index i ON c.oid = i.indexrelid
+LEFT JOIN pg_stat_user_indexes psi ON psi.indexrelid = c.oid
+ORDER BY 
+    ph.table_type,
+    pi.schemaname,
+    pi.tablename,
+    CASE WHEN i.indisvalid THEN 1 ELSE 0 END,  -- Invalid first
+    pi.indexname;
+
+    -- 
