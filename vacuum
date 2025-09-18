@@ -1,0 +1,299 @@
+Vacuum check - 
+
+- -- Quick overview of vacuum and analyze status for all tables
+SELECT 
+    schemaname,
+    tablename,
+    n_live_tup AS live_rows,
+    n_dead_tup AS dead_rows,
+    ROUND((n_dead_tup::numeric / NULLIF(n_live_tup + n_dead_tup, 0)) * 100, 2) AS dead_row_percent,
+    last_vacuum,
+    last_autovacuum,
+    last_analyze, 
+    last_autoanalyze,
+    vacuum_count,
+    autovacuum_count,
+    analyze_count,
+    autoanalyze_count
+FROM pg_stat_user_tables 
+WHERE schemaname NOT IN ('information_schema', 'pg_catalog')
+ORDER BY 
+    COALESCE(last_autovacuum, last_vacuum, '1970-01-01'::timestamp) ASC,
+    n_dead_tup DESC;
+
+---
+
+-- Detailed vacuum status with time calculations
+SELECT 
+    schemaname,
+    tablename,
+    n_live_tup AS live_rows,
+    n_dead_tup AS dead_rows,
+    CASE 
+        WHEN n_live_tup + n_dead_tup = 0 THEN 0
+        ELSE ROUND((n_dead_tup::numeric / (n_live_tup + n_dead_tup)) * 100, 2)
+    END AS dead_row_percent,
+    
+    -- Manual Vacuum Info
+    last_vacuum AS last_manual_vacuum,
+    vacuum_count AS manual_vacuum_count,
+    CASE 
+        WHEN last_vacuum IS NULL THEN 'NEVER'
+        ELSE EXTRACT(days FROM now() - last_vacuum)::text || ' days ago'
+    END AS days_since_manual_vacuum,
+    
+    -- Auto Vacuum Info  
+    last_autovacuum,
+    autovacuum_count,
+    CASE 
+        WHEN last_autovacuum IS NULL THEN 'NEVER'
+        ELSE EXTRACT(days FROM now() - last_autovacuum)::text || ' days ago'
+    END AS days_since_autovacuum,
+    
+    -- Most Recent Vacuum (manual or auto)
+    GREATEST(last_vacuum, last_autovacuum) AS most_recent_vacuum,
+    CASE 
+        WHEN GREATEST(last_vacuum, last_autovacuum) IS NULL THEN 'NEVER VACUUMED'
+        WHEN EXTRACT(days FROM now() - GREATEST(last_vacuum, last_autovacuum)) > 7 THEN '🔴 OVERDUE'
+        WHEN EXTRACT(days FROM now() - GREATEST(last_vacuum, last_autovacuum)) > 3 THEN '🟡 NEEDS ATTENTION'
+        ELSE '✅ RECENT'
+    END AS vacuum_status,
+    
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS table_size
+    
+FROM pg_stat_user_tables
+WHERE schemaname NOT IN ('information_schema', 'pg_catalog')
+ORDER BY 
+    CASE 
+        WHEN GREATEST(last_vacuum, last_autovacuum) IS NULL THEN 1
+        ELSE 0
+    END,
+    GREATEST(last_vacuum, last_autovacuum) ASC NULLS FIRST,
+    n_dead_tup DESC;
+
+-
+
+
+
+-- Detailed analyze status with statistics staleness
+SELECT 
+    schemaname,
+    tablename,
+    n_live_tup AS live_rows,
+    n_mod_since_analyze AS rows_modified_since_analyze,
+    CASE 
+        WHEN n_live_tup = 0 THEN 0
+        ELSE ROUND((n_mod_since_analyze::numeric / NULLIF(n_live_tup, 0)) * 100, 2)
+    END AS percent_modified_since_analyze,
+    
+    -- Manual Analyze Info
+    last_analyze AS last_manual_analyze,
+    analyze_count AS manual_analyze_count,
+    CASE 
+        WHEN last_analyze IS NULL THEN 'NEVER'
+        ELSE EXTRACT(days FROM now() - last_analyze)::text || ' days ago'
+    END AS days_since_manual_analyze,
+    
+    -- Auto Analyze Info
+    last_autoanalyze,
+    autoanalyze_count,
+    CASE 
+        WHEN last_autoanalyze IS NULL THEN 'NEVER'  
+        ELSE EXTRACT(days FROM now() - last_autoanalyze)::text || ' days ago'
+    END AS days_since_autoanalyze,
+    
+    -- Most Recent Analyze (manual or auto)
+    GREATEST(last_analyze, last_autoanalyze) AS most_recent_analyze,
+    CASE 
+        WHEN GREATEST(last_analyze, last_autoanalyze) IS NULL THEN 'NEVER ANALYZED'
+        WHEN n_mod_since_analyze > n_live_tup * 0.5 THEN '🔴 STATISTICS VERY STALE'
+        WHEN n_mod_since_analyze > n_live_tup * 0.1 THEN '🟡 STATISTICS STALE'
+        WHEN EXTRACT(days FROM now() - GREATEST(last_analyze, last_autoanalyze)) > 7 THEN '🟡 OLD ANALYSIS'
+        ELSE '✅ FRESH STATISTICS'
+    END AS analyze_status,
+    
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS table_size
+    
+FROM pg_stat_user_tables
+WHERE schemaname NOT IN ('information_schema', 'pg_catalog')
+ORDER BY 
+    CASE 
+        WHEN GREATEST(last_analyze, last_autoanalyze) IS NULL THEN 1
+        ELSE 0  
+    END,
+    n_mod_since_analyze DESC,
+    GREATEST(last_analyze, last_autoanalyze) ASC NULLS FIRST;
+
+---
+
+-- Executive dashboard showing both vacuum and analyze status
+SELECT 
+    schemaname,
+    tablename,
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS table_size,
+    n_live_tup AS live_rows,
+    n_dead_tup AS dead_rows,
+    n_mod_since_analyze AS modified_since_analyze,
+    
+    -- Vacuum Status
+    CASE 
+        WHEN GREATEST(last_vacuum, last_autovacuum) IS NULL THEN '❌ NEVER'
+        WHEN EXTRACT(days FROM now() - GREATEST(last_vacuum, last_autovacuum)) > 7 THEN '🔴 ' || EXTRACT(days FROM now() - GREATEST(last_vacuum, last_autovacuum))::text || 'd ago'
+        WHEN EXTRACT(days FROM now() - GREATEST(last_vacuum, last_autovacuum)) > 1 THEN '🟡 ' || EXTRACT(days FROM now() - GREATEST(last_vacuum, last_autovacuum))::text || 'd ago'
+        ELSE '✅ Recent'
+    END AS vacuum_status,
+    
+    -- Analyze Status  
+    CASE 
+        WHEN GREATEST(last_analyze, last_autoanalyze) IS NULL THEN '❌ NEVER'
+        WHEN n_mod_since_analyze > n_live_tup * 0.2 THEN '🔴 STALE (' || n_mod_since_analyze || ' changes)'
+        WHEN n_mod_since_analyze > n_live_tup * 0.1 THEN '🟡 AGING (' || n_mod_since_analyze || ' changes)'
+        WHEN EXTRACT(days FROM now() - GREATEST(last_analyze, last_autoanalyze)) > 7 THEN '🟡 OLD'
+        ELSE '✅ Fresh'
+    END AS analyze_status,
+    
+    -- Last Operations
+    GREATEST(last_vacuum, last_autovacuum) AS last_vacuum_any,
+    GREATEST(last_analyze, last_autoanalyze) AS last_analyze_any,
+    
+    -- Operation Counts
+    (vacuum_count + autovacuum_count) AS total_vacuums,
+    (analyze_count + autoanalyze_count) AS total_analyzes
+    
+FROM pg_stat_user_tables
+WHERE schemaname NOT IN ('information_schema', 'pg_catalog')
+ORDER BY 
+    pg_total_relation_size(schemaname||'.'||tablename) DESC;
+
+--
+
+
+-- Tables that urgently need vacuum (high dead tuple ratio)
+SELECT 
+    schemaname,
+    tablename,
+    n_live_tup AS live_rows,
+    n_dead_tup AS dead_rows,
+    ROUND((n_dead_tup::numeric / NULLIF(n_live_tup + n_dead_tup, 0)) * 100, 2) AS dead_row_percent,
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS table_size,
+    GREATEST(last_vacuum, last_autovacuum) AS last_vacuum_any,
+    CASE 
+        WHEN GREATEST(last_vacuum, last_autovacuum) IS NULL THEN 'NEVER VACUUMED'
+        ELSE EXTRACT(days FROM now() - GREATEST(last_vacuum, last_autovacuum))::text || ' days ago'
+    END AS time_since_vacuum,
+    'VACUUM ANALYZE ' || schemaname || '.' || tablename || ';' AS recommended_action
+FROM pg_stat_user_tables
+WHERE schemaname NOT IN ('information_schema', 'pg_catalog')
+  AND (
+    -- High dead tuple percentage
+    (n_dead_tup::numeric / NULLIF(n_live_tup + n_dead_tup, 0)) > 0.1  -- >10% dead
+    OR
+    -- Never been vacuumed and has dead tuples
+    (GREATEST(last_vacuum, last_autovacuum) IS NULL AND n_dead_tup > 100)
+    OR  
+    -- Not vacuumed in over a week and has dead tuples
+    (EXTRACT(days FROM now() - GREATEST(last_vacuum, last_autovacuum)) > 7 AND n_dead_tup > 1000)
+  )
+ORDER BY 
+    (n_dead_tup::numeric / NULLIF(n_live_tup + n_dead_tup, 0)) DESC,
+    n_dead_tup DESC;
+
+--
+
+
+---- Tables with stale statistics that need analyze
+SELECT 
+    schemaname,
+    tablename,
+    n_live_tup AS live_rows,
+    n_mod_since_analyze AS changes_since_analyze,
+    ROUND((n_mod_since_analyze::numeric / NULLIF(n_live_tup, 0)) * 100, 2) AS percent_changed,
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS table_size,
+    GREATEST(last_analyze, last_autoanalyze) AS last_analyze_any,
+    CASE 
+        WHEN GREATEST(last_analyze, last_autoanalyze) IS NULL THEN 'NEVER ANALYZED'
+        ELSE EXTRACT(days FROM now() - GREATEST(last_analyze, last_autoanalyze))::text || ' days ago'
+    END AS time_since_analyze,
+    'ANALYZE ' || schemaname || '.' || tablename || ';' AS recommended_action
+FROM pg_stat_user_tables  
+WHERE schemaname NOT IN ('information_schema', 'pg_catalog')
+  AND (
+    -- High percentage of changes since last analyze
+    (n_mod_since_analyze::numeric / NULLIF(n_live_tup, 0)) > 0.1  -- >10% changed
+    OR
+    -- Never been analyzed and has data
+    (GREATEST(last_analyze, last_autoanalyze) IS NULL AND n_live_tup > 100)
+    OR
+    -- Not analyzed in over a week and has changes  
+    (EXTRACT(days FROM now() - GREATEST(last_analyze, last_autoanalyze)) > 7 AND n_mod_since_analyze > 1000)
+  )
+ORDER BY 
+    (n_mod_since_analyze::numeric / NULLIF(n_live_tup, 0)) DESC,
+    n_mod_since_analyze DESC;
+
+--
+
+
+
+-- Vacuum/Analyze status for partitioned tables
+WITH partition_hierarchy AS (
+    -- Identify parent tables
+    SELECT 
+        schemaname,
+        tablename,
+        'PARENT' AS table_type
+    FROM pg_tables pt
+    WHERE EXISTS (
+        SELECT 1 FROM pg_partitioned_table ppt 
+        JOIN pg_class pc ON ppt.partrelid = pc.oid
+        JOIN pg_namespace pn ON pc.relnamespace = pn.oid
+        WHERE pn.nspname = pt.schemaname AND pc.relname = pt.tablename
+    )
+    
+    UNION ALL
+    
+    -- Identify partition tables
+    SELECT 
+        schemaname,
+        tablename, 
+        'PARTITION' AS table_type
+    FROM pg_tables pt
+    WHERE EXISTS (
+        SELECT 1 FROM pg_inherits pi
+        JOIN pg_class child ON pi.inhrelid = child.oid
+        JOIN pg_namespace child_ns ON child.relnamespace = child_ns.oid
+        WHERE child_ns.nspname = pt.schemaname AND child.relname = pt.tablename
+    )
+)
+SELECT 
+    ph.table_type,
+    pst.schemaname,
+    pst.tablename,
+    pst.n_live_tup AS live_rows,
+    pst.n_dead_tup AS dead_rows,
+    pst.n_mod_since_analyze AS modified_since_analyze,
+    
+    -- Vacuum Info
+    GREATEST(pst.last_vacuum, pst.last_autovacuum) AS last_vacuum_any,
+    CASE 
+        WHEN GREATEST(pst.last_vacuum, pst.last_autovacuum) IS NULL THEN 'NEVER'
+        ELSE EXTRACT(days FROM now() - GREATEST(pst.last_vacuum, pst.last_autovacuum))::text || ' days ago'
+    END AS vacuum_age,
+    
+    -- Analyze Info
+    GREATEST(pst.last_analyze, pst.last_autoanalyze) AS last_analyze_any,
+    CASE 
+        WHEN GREATEST(pst.last_analyze, pst.last_autoanalyze) IS NULL THEN 'NEVER'
+        ELSE EXTRACT(days FROM now() - GREATEST(pst.last_analyze, pst.last_autoanalyze))::text || ' days ago'
+    END AS analyze_age,
+    
+    pg_size_pretty(pg_total_relation_size(pst.schemaname||'.'||pst.tablename)) AS table_size
+    
+FROM partition_hierarchy ph
+JOIN pg_stat_user_tables pst ON ph.schemaname = pst.schemaname AND ph.tablename = pst.tablename
+ORDER BY 
+    ph.table_type,
+    pst.schemaname,
+    CASE ph.table_type WHEN 'PARENT' THEN pst.tablename ELSE regexp_replace(pst.tablename, '.*_([0-9]+_[0-9]+)$', '\1') END;
+
+--
