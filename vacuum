@@ -297,3 +297,45 @@ ORDER BY
     CASE ph.table_type WHEN 'PARENT' THEN pst.tablename ELSE regexp_replace(pst.tablename, '.*_([0-9]+_[0-9]+)$', '\1') END;
 
 --
+
+
+++++++++
+
+
+
+-- Check if statistics are fresh after your VACUUM ANALYZE
+SELECT 
+    schemaname,
+    tablename,
+    n_live_tup,
+    n_dead_tup,
+    last_analyze,
+    last_autoanalyze,
+    n_mod_since_analyze,
+    CASE 
+        WHEN GREATEST(last_analyze, last_autoanalyze) > (now() - interval '1 hour') THEN '✅ FRESH'
+        WHEN GREATEST(last_analyze, last_autoanalyze) > (now() - interval '1 day') THEN '🟡 RECENT'
+        ELSE '🔴 STALE'
+    END AS stats_status
+FROM pg_stat_user_tables
+WHERE schemaname = 'your_schema' 
+  AND tablename = 'your_table';
+
+
+--
+
+-- Verify indexes exist and are being recognized
+SELECT 
+    schemaname,
+    tablename,
+    indexname,
+    idx_scan AS times_used,
+    idx_tup_read AS tuples_read,
+    idx_tup_fetch AS tuples_fetched,
+    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size
+FROM pg_stat_user_indexes 
+WHERE schemaname = 'your_schema' 
+  AND tablename = 'your_table'
+ORDER BY indexname;
+
+--
