@@ -622,16 +622,15 @@ ORDER BY
 
 
     -- Ask for schema and table dynamically
--- (You can pass them in psql: \set schema_name 'public'  \set table_name 'orders')
-
 WITH partition_hierarchy AS (
+    -- Parent table
     SELECT 
         pt.schemaname,
         pt.tablename,
         'PARENT' as table_type
     FROM pg_tables pt
-    WHERE pt.schemaname = :'schema_name' 
-      AND pt.tablename = :'table_name'
+    WHERE pt.schemaname = 'public'  -- 🔑 Replace with your schema
+      AND pt.tablename = 'orders'  -- 🔑 Replace with your table name
       AND EXISTS (
         SELECT 1 
         FROM pg_partitioned_table ppt 
@@ -643,12 +642,13 @@ WITH partition_hierarchy AS (
     
     UNION ALL
     
+    -- Child partitions
     SELECT 
         pt.schemaname,
         pt.tablename,
         'PARTITION' as table_type
     FROM pg_tables pt
-    WHERE pt.schemaname = :'schema_name'
+    WHERE pt.schemaname = 'public'  -- 🔑 Replace with your schema
       AND EXISTS (
         SELECT 1 
         FROM pg_inherits pi
@@ -657,8 +657,8 @@ WITH partition_hierarchy AS (
         JOIN pg_class parent ON pi.inhparent = parent.oid
         JOIN pg_namespace parent_ns ON parent.relnamespace = parent_ns.oid
         WHERE child_ns.nspname = pt.schemaname 
-          AND parent_ns.nspname = :'schema_name'
-          AND parent.relname = :'table_name'
+          AND parent_ns.nspname = 'public'   -- 🔑 Replace with your schema
+          AND parent.relname = 'orders'      -- 🔑 Replace with your table name
           AND child.relname = pt.tablename
     )
 )
@@ -695,6 +695,7 @@ ORDER BY
     ph.table_type,
     pi.schemaname,
     pi.tablename,
-    CASE WHEN i.indisvalid THEN 1 ELSE 0 END,  -- Invalid first
+    CASE WHEN i.indisvalid THEN 1 ELSE 0 END,
     pi.indexname;
+
 
