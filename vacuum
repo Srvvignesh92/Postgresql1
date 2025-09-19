@@ -346,3 +346,47 @@ SELECT indexrelid::regclass AS index_name,
        indispartition 
 FROM pg_index 
 WHERE indrelid = 'orders'::regclass;
+
+
+---
+
+
+
+WITH partition_info AS (
+    SELECT
+        c.oid AS parent_oid,
+        c.relname AS parent_table,
+        c2.oid AS partition_oid,
+        c2.relname AS partition_table
+    FROM pg_inherits
+    JOIN pg_class c ON pg_inherits.inhparent = c.oid
+    JOIN pg_class c2 ON pg_inherits.inhrelid = c2.oid
+    WHERE c.relname = 'orders'  -- 🔑 Replace with your parent table name
+),
+indexes AS (
+    SELECT
+        i.indexrelid::regclass AS index_name,
+        i.indrelid::regclass AS table_name,
+        i.indispartition,
+        pg_get_indexdef(i.indexrelid) AS index_def
+    FROM pg_index i
+)
+SELECT
+    p.parent_table,
+    p.partition_table,
+    ix.index_name,
+    ix.indispartition AS is_partition_index,
+    ix.index_def
+FROM partition_info p
+JOIN indexes ix ON ix.table_name = p.partition_table
+UNION
+SELECT
+    p.parent_table,
+    NULL AS partition_table,
+    ix.index_name,
+    ix.indispartition AS is_partition_index,
+    ix.index_def
+FROM partition_info p
+JOIN indexes ix ON ix.table_name = p.parent_table
+ORDER BY partition_table NULLS FIRST, index_name;
+
