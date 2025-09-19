@@ -339,3 +339,10 @@ WHERE schemaname = 'your_schema'
 ORDER BY indexname;
 
 --
+
+
+SELECT indexrelid::regclass AS index_name, 
+       indrelid::regclass AS table_name, 
+       indispartition 
+FROM pg_index 
+WHERE indrelid = 'orders'::regclass;
