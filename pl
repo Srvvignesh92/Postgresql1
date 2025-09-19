@@ -698,4 +698,81 @@ ORDER BY
     CASE WHEN i.indisvalid THEN 1 ELSE 0 END,
     pi.indexname;
 
+---
+
+
+
+WITH partition_hierarchy AS (
+    -- Parent table
+    SELECT 
+        pt.schemaname,
+        pt.tablename,
+        'PARENT' as table_type
+    FROM pg_tables pt
+    WHERE pt.schemaname = 'public'  -- 🔑 Replace with your schema
+      AND pt.tablename = 'orders'  -- 🔑 Replace with your table name
+      AND EXISTS (
+        SELECT 1 
+        FROM pg_partitioned_table ppt 
+        JOIN pg_class pc ON ppt.partrelid = pc.oid
+        JOIN pg_namespace pn ON pc.relnamespace = pn.oid
+        WHERE pn.nspname = pt.schemaname 
+          AND pc.relname = pt.tablename
+    )
+    
+    UNION ALL
+    
+    -- Child partitions
+    SELECT 
+        pt.schemaname,
+        pt.tablename,
+        'PARTITION' as table_type
+    FROM pg_tables pt
+    WHERE pt.schemaname = 'public'  -- 🔑 Replace with your schema
+      AND EXISTS (
+        SELECT 1 
+        FROM pg_inherits pi
+        JOIN pg_class child ON pi.inhrelid = child.oid
+        JOIN pg_namespace child_ns ON child.relnamespace = child_ns.oid
+        JOIN pg_class parent ON pi.inhparent = parent.oid
+        JOIN pg_namespace parent_ns ON parent.relnamespace = parent_ns.oid
+        WHERE child_ns.nspname = pt.schemaname 
+          AND parent_ns.nspname = 'public'   -- 🔑 Replace with your schema
+          AND parent.relname = 'orders'      -- 🔑 Replace with your table name
+          AND child.relname = pt.tablename
+    )
+)
+SELECT 
+    ph.table_type,
+    pi.schemaname,
+    pi.tablename,
+    pi.indexname,
+    CASE 
+        WHEN i.indisvalid THEN '✅ VALID'
+        ELSE '❌ INVALID'
+    END AS validity_status,
+    CASE 
+        WHEN i.indisready THEN '✅ READY'
+        ELSE '❌ BUILDING'
+    END AS ready_status,
+    'REGULAR' AS index_type,
+    pg_size_pretty(pg_relation_size(c.oid)) AS index_size,
+    COALESCE(psi.idx_scan, 0) AS usage_count,
+    pi.indexdef
+FROM partition_hierarchy ph
+JOIN pg_indexes pi 
+  ON ph.schemaname = pi.schemaname 
+ AND ph.tablename = pi.tablename
+JOIN pg_class c ON pi.indexname = c.relname
+JOIN pg_index i ON c.oid = i.indexrelid
+LEFT JOIN pg_stat_user_indexes psi ON psi.indexrelid = c.oid
+WHERE NOT i.indisprimary  -- ❌ Exclude primary key indexes
+  AND NOT i.indisunique   -- ❌ Exclude unique indexes
+ORDER BY 
+    ph.table_type,
+    pi.schemaname,
+    pi.tablename,
+    pi.indexname;
+
+-- 
 
