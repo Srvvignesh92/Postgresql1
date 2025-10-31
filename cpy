@@ -12,3 +12,17 @@ FROM your_table;
 
       SELECT LENGTHB(x.xmlcol.getStringVal()) AS xml_length_bytes
 FROM your_table x;
+
+      SELECT
+  ROUND(SUM(DBMS_LOB.GETLENGTH(XMLSERIALIZE(CONTENT xml_col AS CLOB))) / 1024 / 1024, 2) AS total_mb,
+  ROUND(MAX(DBMS_LOB.GETLENGTH(XMLSERIALIZE(CONTENT xml_col AS CLOB))) / 1024 / 1024, 2) AS max_mb,
+  ROUND(AVG(DBMS_LOB.GETLENGTH(XMLSERIALIZE(CONTENT xml_col AS CLOB))) / 1024 / 1024, 2) AS avg_mb,
+  COUNT(*) AS row_count
+FROM your_table;
+
+
+      SELECT primary_key_column,
+       DBMS_LOB.GETLENGTH(XMLSERIALIZE(CONTENT xml_col AS CLOB)) AS xml_bytes
+FROM your_table
+ORDER BY xml_bytes DESC
+FETCH FIRST 1 ROW ONLY;
