@@ -397,3 +397,394 @@ stage('List and Filter IAM Roles by BA Tag') {
     }
 
 ++
+
+
+
+#!/usr/bin/env groovy
+
+/**
+ * Jenkins Pipeline: IAM Role Discovery - Stage 1 Testing
+ * 
+ * This is a simplified version for testing the basic flow:
+ * 1. Validate parameters
+ * 2. Assume read-only role
+ * 3. List and filter roles by BA tag
+ */
+
+pipeline {
+    agent any
+    
+    parameters {
+        string(
+            name: 'BA_NAME',
+            defaultValue: '',
+            description: 'Business Application Name (will be used to filter IAM roles by tag)',
+            trim: true
+        )
+        string(
+            name: 'AWS_ACCOUNT_ID',
+            defaultValue: '',
+            description: 'AWS Account ID (12-digit account number)',
+            trim: true
+        )
+        string(
+            name: 'ASSUME_ROLE_ARN',
+            defaultValue: '',
+            description: 'ARN of the read-only role to assume (optional - leave empty to use default credentials)',
+            trim: true
+        )
+    }
+    
+    environment {
+        AWS_DEFAULT_OUTPUT = 'json'
+        WORKSPACE_DIR = "${WORKSPACE}"
+    }
+    
+    stages {
+        stage('Validate Input Parameters') {
+            steps {
+                script {
+                    echo "=========================================="
+                    echo "STAGE 1: Validate Input Parameters"
+                    echo "=========================================="
+                    
+                    // Validate BA Name
+                    if (!params.BA_NAME || params.BA_NAME.trim().isEmpty()) {
+                        error("BA_NAME parameter is required. Please provide a Business Application name.")
+                    }
+                    
+                    // Validate AWS Account ID
+                    if (!params.AWS_ACCOUNT_ID || !params.AWS_ACCOUNT_ID.matches(/^\d{12}$/)) {
+                        error("AWS_ACCOUNT_ID must be a 12-digit number. Provided: ${params.AWS_ACCOUNT_ID}")
+                    }
+                    
+                    echo "✓ BA Name: ${params.BA_NAME}"
+                    echo "✓ AWS Account ID: ${params.AWS_ACCOUNT_ID}"
+                    
+                    if (params.ASSUME_ROLE_ARN && !params.ASSUME_ROLE_ARN.trim().isEmpty()) {
+                        echo "✓ Assume Role ARN: ${params.ASSUME_ROLE_ARN}"
+                    } else {
+                        echo "ℹ Using default AWS credentials (no role assumption)"
+                    }
+                    
+                    echo ""
+                }
+            }
+        }
+        
+        stage('Setup AWS Credentials') {
+            steps {
+                script {
+                    echo "=========================================="
+                    echo "STAGE 2: Setup AWS Credentials"
+                    echo "=========================================="
+                    
+                    // Verify AWS CLI is installed
+                    def awsVersion = sh(
+                        script: 'aws --version',
+                        returnStdout: true
+                    ).trim()
+                    echo "AWS CLI Version: ${awsVersion}"
+                    
+                    // Check if we need to assume a role
+                    if (params.ASSUME_ROLE_ARN && !params.ASSUME_ROLE_ARN.trim().isEmpty()) {
+                        echo ""
+                        echo "Assuming role: ${params.ASSUME_ROLE_ARN}"
+                        
+                        try {
+                            // Assume the role
+                            def assumeRoleOutput = sh(
+                                script: """
+                                    aws sts assume-role \
+                                        --role-arn "${params.ASSUME_ROLE_ARN}" \
+                                        --role-session-name "jenkins-iam-discovery-\${BUILD_NUMBER}" \
+                                        --duration-seconds 3600 \
+                                        --output json
+                                """,
+                                returnStdout: true
+                            ).trim()
+                            
+                            // Parse the credentials
+                            def credentials = readJSON text: assumeRoleOutput
+                            
+                            // Set environment variables for assumed role credentials
+                            env.AWS_ACCESS_KEY_ID = credentials.Credentials.AccessKeyId
+                            env.AWS_SECRET_ACCESS_KEY = credentials.Credentials.SecretAccessKey
+                            env.AWS_SESSION_TOKEN = credentials.Credentials.SessionToken
+                            
+                            echo "✓ Successfully assumed role"
+                            
+                            // Verify the assumed identity
+                            def identity = sh(
+                                script: 'aws sts get-caller-identity --output json',
+                                returnStdout: true
+                            ).trim()
+                            
+                            def identityData = readJSON text: identity
+                            echo "✓ Current Identity:"
+                            echo "  - Account: ${identityData.Account}"
+                            echo "  - ARN: ${identityData.Arn}"
+                            echo "  - User ID: ${identityData.UserId}"
+                            
+                            // Verify it matches the expected account
+                            if (identityData.Account != params.AWS_ACCOUNT_ID) {
+                                error("Assumed role account (${identityData.Account}) does not match expected account (${params.AWS_ACCOUNT_ID})")
+                            }
+                            
+                        } catch (Exception e) {
+                            error("Failed to assume role: ${e.message}")
+                        }
+                        
+                    } else {
+                        echo ""
+                        echo "Using default AWS credentials..."
+                        
+                        // Verify default credentials work
+                        try {
+                            def identity = sh(
+                                script: 'aws sts get-caller-identity --output json',
+                                returnStdout: true
+                            ).trim()
+                            
+                            def identityData = readJSON text: identity
+                            echo "✓ Current Identity:"
+                            echo "  - Account: ${identityData.Account}"
+                            echo "  - ARN: ${identityData.Arn}"
+                            echo "  - User ID: ${identityData.UserId}"
+                            
+                            // Verify it matches the expected account
+                            if (identityData.Account != params.AWS_ACCOUNT_ID) {
+                                error("Current AWS account (${identityData.Account}) does not match expected account (${params.AWS_ACCOUNT_ID})")
+                            }
+                            
+                        } catch (Exception e) {
+                            error("Failed to verify AWS credentials: ${e.message}")
+                        }
+                    }
+                    
+                    echo ""
+                    echo "✓ AWS credentials configured successfully"
+                }
+            }
+        }
+        
+        stage('List and Filter Roles by BA Tag') {
+            steps {
+                script {
+                    echo "=========================================="
+                    echo "STAGE 3: List and Filter Roles by BA Tag"
+                    echo "=========================================="
+                    echo ""
+                    echo "Searching for IAM roles with BA tag: ${params.BA_NAME}"
+                    echo ""
+                    
+                    try {
+                        // List and filter roles by BA tag with optimizations
+                        def filterResult = sh(
+                            script: """
+                                #!/bin/bash
+                                set -e
+                                
+                                echo "Fetching all IAM role names..."
+                                
+                                # Get all role names with their paths to filter out AWS service roles
+                                roles_json=\$(aws iam list-roles --query 'Roles[].{Name:RoleName,Path:Path}' --output json)
+                                
+                                if [ "\$roles_json" = "[]" ]; then
+                                    echo "WARNING: No IAM roles found in the account"
+                                    echo "[]"
+                                    exit 0
+                                fi
+                                
+                                # Filter out AWS service-linked roles and AWS managed service roles
+                                role_names=\$(echo "\$roles_json" | jq -r '.[] | 
+                                    select(.Path | startswith("/aws-service-role/") | not) | 
+                                    select(.Path | startswith("/aws-reserved/") | not) |
+                                    select(.Name | startswith("AWSServiceRoleFor") | not) |
+                                    .Name')
+                                
+                                if [ -z "\$role_names" ]; then
+                                    echo "WARNING: No user-created IAM roles found (all are AWS service roles)"
+                                    echo "[]"
+                                    exit 0
+                                fi
+                                
+                                total_roles=\$(echo "\$role_names" | wc -l)
+                                echo "Total user-created IAM roles: \$total_roles (AWS service roles excluded)"
+                                echo ""
+                                
+                                # Initialize array for matching roles
+                                matching_roles=()
+                                processed=0
+                                
+                                echo "Checking tags for each role..."
+                                echo ""
+                                
+                                # Check each role for the BA tag
+                                for role in \$role_names; do
+                                    processed=\$((processed + 1))
+                                    
+                                    # Show progress every 50 roles
+                                    if [ \$((processed % 50)) -eq 0 ]; then
+                                        echo "Progress: Processed \$processed/\$total_roles roles..."
+                                    fi
+                                    
+                                    # Get tags for this role
+                                    tags=\$(aws iam list-role-tags --role-name "\$role" --output json 2>/dev/null || echo '{"Tags":[]}')
+                                    
+                                    # Check if BA tag matches
+                                    ba_tag=\$(echo "\$tags" | jq -r '.Tags[] | select(.Key=="BA" or .Key=="BusinessApplication") | .Value' 2>/dev/null || echo "")
+                                    
+                                    if [[ "\$ba_tag" == "${params.BA_NAME}" ]]; then
+                                        echo "✓ MATCH: \$role"
+                                        matching_roles+=("\$role")
+                                    fi
+                                done
+                                
+                                echo ""
+                                echo "Filtering complete. Processed \$total_roles roles."
+                                echo ""
+                                
+                                # Convert array to JSON
+                                if [ \${#matching_roles[@]} -eq 0 ]; then
+                                    echo "[]"
+                                else
+                                    printf '%s\\n' "\${matching_roles[@]}" | jq -R . | jq -s -c .
+                                fi
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        // Parse the JSON output (last line should be the JSON array)
+                        def outputLines = filterResult.split('\n')
+                        def jsonOutput = outputLines[-1]
+                        
+                        def matchingRoles = readJSON text: jsonOutput
+                        
+                        echo ""
+                        echo "=========================================="
+                        echo "RESULTS"
+                        echo "=========================================="
+                        
+                        if (matchingRoles.size() == 0) {
+                            echo "⚠ No IAM roles found with BA tag: ${params.BA_NAME}"
+                            echo ""
+                            echo "Possible reasons:"
+                            echo "1. No roles exist with this BA tag value"
+                            echo "2. Roles have different tag key (not 'BA' or 'BusinessApplication')"
+                            echo "3. Tag value is case-sensitive - verify exact match"
+                            echo ""
+                            echo "To tag a role, use:"
+                            echo "aws iam tag-role --role-name <ROLE_NAME> --tags Key=BA,Value=${params.BA_NAME}"
+                            
+                            env.ROLES_FOUND = 'false'
+                            env.ROLE_COUNT = '0'
+                            
+                        } else {
+                            echo "✓ Found ${matchingRoles.size()} IAM role(s) with BA tag: ${params.BA_NAME}"
+                            echo ""
+                            echo "Matching Roles:"
+                            echo "---------------"
+                            
+                            matchingRoles.eachWithIndex { roleName, index ->
+                                echo "${index + 1}. ${roleName}"
+                            }
+                            
+                            env.ROLES_FOUND = 'true'
+                            env.ROLE_COUNT = matchingRoles.size().toString()
+                            env.ROLE_NAMES = matchingRoles.join(',')
+                            
+                            echo ""
+                            echo "Role names stored in environment variable: ROLE_NAMES"
+                            echo "Ready to proceed to next stages for policy extraction"
+                        }
+                        
+                        echo "=========================================="
+                        
+                    } catch (Exception e) {
+                        error("Failed to list and filter IAM roles: ${e.message}")
+                    }
+                }
+            }
+        }
+        
+        stage('Test Summary') {
+            steps {
+                script {
+                    echo ""
+                    echo "=========================================="
+                    echo "TEST SUMMARY"
+                    echo "=========================================="
+                    echo ""
+                    echo "Configuration:"
+                    echo "  - BA Name: ${params.BA_NAME}"
+                    echo "  - AWS Account: ${params.AWS_ACCOUNT_ID}"
+                    
+                    if (params.ASSUME_ROLE_ARN && !params.ASSUME_ROLE_ARN.trim().isEmpty()) {
+                        echo "  - Assumed Role: ${params.ASSUME_ROLE_ARN}"
+                    } else {
+                        echo "  - Assumed Role: None (using default credentials)"
+                    }
+                    
+                    echo ""
+                    echo "Results:"
+                    echo "  - Roles Found: ${env.ROLE_COUNT ?: '0'}"
+                    
+                    if (env.ROLES_FOUND == 'true') {
+                        echo "  - Role Names: ${env.ROLE_NAMES}"
+                        echo ""
+                        echo "✓ Stage 1 Testing SUCCESSFUL"
+                        echo ""
+                        echo "Next Steps:"
+                        echo "1. Verify the roles listed above are correct"
+                        echo "2. Proceed to add Stage 2 (Extract Policy Names)"
+                        echo "3. Then add Stage 3 (CloudFormation Template Discovery)"
+                    } else {
+                        echo ""
+                        echo "⚠ No roles found - verify your BA tag configuration"
+                    }
+                    
+                    echo "=========================================="
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            script {
+                echo ""
+                echo "✓ Pipeline completed successfully!"
+                
+                if (env.ROLES_FOUND == 'true') {
+                    echo "✓ Found ${env.ROLE_COUNT} IAM role(s)"
+                    echo "✓ Ready to proceed with next stages"
+                } else {
+                    echo "ℹ No roles found for BA: ${params.BA_NAME}"
+                    echo "ℹ Check your tag configuration and try again"
+                }
+            }
+        }
+        failure {
+            echo ""
+            echo "✗ Pipeline failed. Please check the logs above for details."
+        }
+        always {
+            script {
+                // Clean up assumed role credentials from environment
+                if (params.ASSUME_ROLE_ARN && !params.ASSUME_ROLE_ARN.trim().isEmpty()) {
+                    env.AWS_ACCESS_KEY_ID = ''
+                    env.AWS_SECRET_ACCESS_KEY = ''
+                    env.AWS_SESSION_TOKEN = ''
+                    echo ""
+                    echo "Cleaned up assumed role credentials"
+                }
+                
+                echo ""
+                echo "Pipeline execution completed at: ${new Date()}"
+            }
+        }
+    }
+}
+
+++
