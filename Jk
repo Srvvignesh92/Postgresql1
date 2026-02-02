@@ -201,7 +201,10 @@ stage('List and Filter Roles by BA Tag') {
                                 export -f check_role_tag
                                 
                                 # Process roles in parallel (20 at a time to avoid rate limits)
-                                echo "\$role_names" | xargs -P 20 -I {} bash -c 'check_role_tag "{}" "${params.BA_NAME}" "'\$temp_dir'"'
+                                echo "$role_names" | \
+xargs -P 20 -n 1 bash -c '
+  check_role_tag "$1" "$2" "$3"
+' _ {} "${params.BA_NAME}" "$temp_dir"
                                 
                                 echo ""
                                 echo "Filtering complete."
