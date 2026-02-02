@@ -276,3 +276,124 @@ xargs -P 20 -n 1 bash -c '
             }
         }
 +++
+
+
+
+stage('List and Filter IAM Roles by BA Tag') {
+            steps {
+                script {
+                    echo "Searching IAM roles with BA tag: ${params.BA_NAME}"
+
+                    def result = sh(
+                        script: """
+                        #!/bin/bash
+                        set -euo pipefail
+
+                        BA_NAME="${params.BA_NAME}"
+                        MAX_JOBS=20
+
+                        roles_json=\$(aws iam list-roles \
+                          --query 'Roles[].{Name:RoleName,Path:Path}' \
+                          --output json)
+
+                        role_names=\$(echo "\$roles_json" | jq -r '
+                          .[] |
+                          select(.Path | startswith("/aws-service-role/") | not) |
+                          select(.Path | startswith("/aws-reserved/") | not) |
+                          select(.Name | startswith("AWSServiceRoleFor") | not) |
+                          .Name
+                        ')
+
+                        if [ -z "\$role_names" ]; then
+                          echo "[]"
+                          exit 0
+                        fi
+
+                        temp_dir=\$(mktemp -d)
+                        trap "rm -rf \$temp_dir" EXIT
+
+                        check_role_tag() {
+                          local role="\$1"
+                          local ba_name="\$2"
+                          local dir="\$3"
+
+                          tags=\$(aws iam list-role-tags \
+                            --role-name "\$role" \
+                            --output json 2>/dev/null || echo '{"Tags":[]}')
+
+                          match=\$(echo "\$tags" | jq -r '
+                            .Tags[]? |
+                            select(.Key=="BA" or .Key=="BusinessApplication") |
+                            select(.Value=="'"\$ba_name"'") |
+                            .Value
+                          ')
+
+                          if [ -n "\$match" ]; then
+                            echo "\$role" >> "\$dir/matches.txt"
+                            echo "✓ MATCH: \$role"
+                          fi
+                        }
+
+                        job_count=0
+
+                        while read -r role; do
+                          check_role_tag "\$role" "\$BA_NAME" "\$temp_dir" &
+                          ((job_count++))
+
+                          if (( job_count >= MAX_JOBS )); then
+                            wait -n
+                            ((job_count--))
+                          fi
+                        done <<< "\$role_names"
+
+                        wait
+
+                        if [ -f "\$temp_dir/matches.txt" ]; then
+                          jq -R -s -c 'split("\\n") | map(select(length>0))' "\$temp_dir/matches.txt"
+                        else
+                          echo "[]"
+                        fi
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    def matchingRoles = readJSON text: result
+
+                    if (matchingRoles.isEmpty()) {
+                        echo "⚠ No IAM roles found for BA=${params.BA_NAME}"
+                        env.ROLES_FOUND = 'false'
+                        env.ROLE_COUNT = '0'
+                    } else {
+                        echo "✓ Found ${matchingRoles.size()} role(s)"
+                        matchingRoles.eachWithIndex { r, i ->
+                            echo "${i + 1}. ${r}"
+                        }
+                        env.ROLES_FOUND = 'true'
+                        env.ROLE_COUNT = matchingRoles.size().toString()
+                        env.ROLE_NAMES = matchingRoles.join(',')
+                    }
+                }
+            }
+        }
+
+        stage('Test Summary') {
+            steps {
+                script {
+                    echo "=================================="
+                    echo "BA_NAME      : ${params.BA_NAME}"
+                    echo "ACCOUNT      : ${params.AWS_ACCOUNT_ID}"
+                    echo "ROLES FOUND  : ${env.ROLE_COUNT ?: 0}"
+
+                    if (env.ROLES_FOUND == 'true') {
+                        echo "ROLE NAMES   : ${env.ROLE_NAMES}"
+                        echo "✓ Stage 1 successful"
+                    } else {
+                        echo "⚠ No roles matched"
+                    }
+                    echo "=================================="
+                }
+            }
+        }
+    }
+
+++
