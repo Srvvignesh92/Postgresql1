@@ -1,0 +1,126 @@
+JK
+
+        stage('List and Filter Roles by BA Tag') {
+            steps {
+                script {
+                    echo "=========================================="
+                    echo "STAGE 3: List and Filter Roles by BA Tag"
+                    echo "=========================================="
+                    echo ""
+                    echo "Searching for IAM roles with BA tag: ${params.BA_NAME}"
+                    echo ""
+                    
+                    try {
+                        // List and filter roles by BA tag
+                        def filterResult = sh(
+                            script: """
+                                #!/bin/bash
+                                set -e
+                                
+                                echo "Fetching all IAM role names..."
+                                
+                                # Get all role names (not full details for security)
+                                role_names=\$(aws iam list-roles \
+                                    --query 'Roles[].RoleName' \
+                                    --output text)
+                                
+                                if [ -z "\$role_names" ]; then
+                                    echo "WARNING: No IAM roles found in the account"
+                                    echo "[]"
+                                    exit 0
+                                fi
+                                
+                                total_roles=\$(echo "\$role_names" | wc -w)
+                                echo "Total IAM roles in account: \$total_roles"
+                                echo ""
+                                
+                                # Initialize array for matching roles
+                                matching_roles="[]"
+                                processed=0
+                                
+                                # Check each role for the BA tag
+                                for role in \$role_names; do
+                                    processed=\$((processed + 1))
+                                    
+                                    # Show progress every 10 roles
+                                    if [ \$((processed % 10)) -eq 0 ]; then
+                                        echo "Progress: Processed \$processed/\$total_roles roles..."
+                                    fi
+                                    
+                                    # Get tags for this role
+                                    tags=\$(aws iam list-role-tags \
+                                        --role-name "\$role" \
+                                        --output json 2>/dev/null || echo '{"Tags":[]}')
+                                    
+                                    # Check if BA tag matches
+                                    ba_tag=\$(echo "\$tags" | jq -r '.Tags[] | select(.Key=="BA" or .Key=="BusinessApplication") | .Value' 2>/dev/null || echo "")
+                                    
+                                    if [[ "\$ba_tag" == "${params.BA_NAME}" ]]; then
+                                        echo "✓ MATCH FOUND: \$role (BA: \$ba_tag)"
+                                        matching_roles=\$(echo "\$matching_roles" | jq ". + [\\"\$role\\"]")
+                                    fi
+                                done
+                                
+                                echo ""
+                                echo "Filtering complete. Processed \$total_roles roles."
+                                echo ""
+                                
+                                # Output the matching roles as JSON
+                                echo "\$matching_roles"
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        // Parse the JSON output (last line should be the JSON array)
+                        def outputLines = filterResult.split('\n')
+                        def jsonOutput = outputLines[-1]
+                        
+                        def matchingRoles = readJSON text: jsonOutput
+                        
+                        echo ""
+                        echo "=========================================="
+                        echo "RESULTS"
+                        echo "=========================================="
+                        
+                        if (matchingRoles.size() == 0) {
+                            echo "⚠ No IAM roles found with BA tag: ${params.BA_NAME}"
+                            echo ""
+                            echo "Possible reasons:"
+                            echo "1. No roles exist with this BA tag value"
+                            echo "2. Roles have different tag key (not 'BA' or 'BusinessApplication')"
+                            echo "3. Tag value is case-sensitive - verify exact match"
+                            echo ""
+                            echo "To tag a role, use:"
+                            echo "aws iam tag-role --role-name <ROLE_NAME> --tags Key=BA,Value=${params.BA_NAME}"
+                            
+                            env.ROLES_FOUND = 'false'
+                            env.ROLE_COUNT = '0'
+                            
+                        } else {
+                            echo "✓ Found ${matchingRoles.size()} IAM role(s) with BA tag: ${params.BA_NAME}"
+                            echo ""
+                            echo "Matching Roles:"
+                            echo "---------------"
+                            
+                            matchingRoles.eachWithIndex { roleName, index ->
+                                echo "${index + 1}. ${roleName}"
+                            }
+                            
+                            env.ROLES_FOUND = 'true'
+                            env.ROLE_COUNT = matchingRoles.size().toString()
+                            env.ROLE_NAMES = matchingRoles.join(',')
+                            
+                            echo ""
+                            echo "Role names stored in environment variable: ROLE_NAMES"
+                            echo "Ready to proceed to next stages for policy extraction"
+                        }
+                        
+                        echo "=========================================="
+                        
+                    } catch (Exception e) {
+                        error("Failed to list and filter IAM roles: ${e.message}")
+                    }
+                }
+            }
+        }
+        
