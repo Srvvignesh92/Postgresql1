@@ -1965,3 +1965,569 @@ pipeline {
 }
 
 ++
+
+CPS - issue fix 
+
+#!/usr/bin/env groovy
+
+/**
+ * Jenkins Pipeline: IAM Role Discovery - Stage 1 Testing
+ * 
+ * This is a simplified version for testing the basic flow:
+ * 1. Validate parameters
+ * 2. Assume read-only role
+ * 3. List and filter roles by BA tag
+ */
+
+pipeline {
+    agent any
+    
+    parameters {
+        string(
+            name: 'BA_NAME',
+            defaultValue: '',
+            description: 'Business Application Name (will be used to filter IAM roles by tag)',
+            trim: true
+        )
+        string(
+            name: 'AWS_ACCOUNT_ID',
+            defaultValue: '',
+            description: 'AWS Account ID (12-digit account number)',
+            trim: true
+        )
+        string(
+            name: 'ASSUME_ROLE_ARN',
+            defaultValue: '',
+            description: 'ARN of the read-only role to assume (optional - leave empty to use default credentials)',
+            trim: true
+        )
+    }
+    
+    environment {
+        AWS_DEFAULT_OUTPUT = 'json'
+        WORKSPACE_DIR = "${WORKSPACE}"
+    }
+    
+    stages {
+        stage('Validate Input Parameters') {
+            steps {
+                script {
+                    echo "=========================================="
+                    echo "STAGE 1: Validate Input Parameters"
+                    echo "=========================================="
+                    
+                    // Validate BA Name
+                    if (!params.BA_NAME || params.BA_NAME.trim().isEmpty()) {
+                        error("BA_NAME parameter is required. Please provide a Business Application name.")
+                    }
+                    
+                    // Validate AWS Account ID
+                    if (!params.AWS_ACCOUNT_ID || !params.AWS_ACCOUNT_ID.matches(/^\d{12}$/)) {
+                        error("AWS_ACCOUNT_ID must be a 12-digit number. Provided: ${params.AWS_ACCOUNT_ID}")
+                    }
+                    
+                    echo "✓ BA Name: ${params.BA_NAME}"
+                    echo "✓ AWS Account ID: ${params.AWS_ACCOUNT_ID}"
+                    
+                    if (params.ASSUME_ROLE_ARN && !params.ASSUME_ROLE_ARN.trim().isEmpty()) {
+                        echo "✓ Assume Role ARN: ${params.ASSUME_ROLE_ARN}"
+                    } else {
+                        echo "ℹ Using default AWS credentials (no role assumption)"
+                    }
+                    
+                    echo ""
+                }
+            }
+        }
+        
+        stage('Setup AWS Credentials') {
+            steps {
+                script {
+                    echo "=========================================="
+                    echo "STAGE 2: Setup AWS Credentials"
+                    echo "=========================================="
+                    
+                    // Verify AWS CLI is installed
+                    def awsVersion = sh(
+                        script: 'aws --version',
+                        returnStdout: true
+                    ).trim()
+                    echo "AWS CLI Version: ${awsVersion}"
+                    
+                    // Check if we need to assume a role
+                    if (params.ASSUME_ROLE_ARN && !params.ASSUME_ROLE_ARN.trim().isEmpty()) {
+                        echo ""
+                        echo "Assuming role: ${params.ASSUME_ROLE_ARN}"
+                        
+                        try {
+                            // Assume the role
+                            def assumeRoleOutput = sh(
+                                script: """
+                                    aws sts assume-role \
+                                        --role-arn "${params.ASSUME_ROLE_ARN}" \
+                                        --role-session-name "jenkins-iam-discovery-\${BUILD_NUMBER}" \
+                                        --duration-seconds 3600 \
+                                        --output json
+                                """,
+                                returnStdout: true
+                            ).trim()
+                            
+                            // Parse the credentials
+                            def credentials = readJSON text: assumeRoleOutput
+                            
+                            // Set environment variables for assumed role credentials
+                            env.AWS_ACCESS_KEY_ID = credentials.Credentials.AccessKeyId
+                            env.AWS_SECRET_ACCESS_KEY = credentials.Credentials.SecretAccessKey
+                            env.AWS_SESSION_TOKEN = credentials.Credentials.SessionToken
+                            
+                            echo "✓ Successfully assumed role"
+                            
+                            // Verify the assumed identity
+                            def identity = sh(
+                                script: 'aws sts get-caller-identity --output json',
+                                returnStdout: true
+                            ).trim()
+                            
+                            def identityData = readJSON text: identity
+                            echo "✓ Current Identity:"
+                            echo "  - Account: ${identityData.Account}"
+                            echo "  - ARN: ${identityData.Arn}"
+                            echo "  - User ID: ${identityData.UserId}"
+                            
+                            // Verify it matches the expected account
+                            if (identityData.Account != params.AWS_ACCOUNT_ID) {
+                                error("Assumed role account (${identityData.Account}) does not match expected account (${params.AWS_ACCOUNT_ID})")
+                            }
+                            
+                        } catch (Exception e) {
+                            error("Failed to assume role: ${e.message}")
+                        }
+                        
+                    } else {
+                        echo ""
+                        echo "Using default AWS credentials..."
+                        
+                        // Verify default credentials work
+                        try {
+                            def identity = sh(
+                                script: 'aws sts get-caller-identity --output json',
+                                returnStdout: true
+                            ).trim()
+                            
+                            def identityData = readJSON text: identity
+                            echo "✓ Current Identity:"
+                            echo "  - Account: ${identityData.Account}"
+                            echo "  - ARN: ${identityData.Arn}"
+                            echo "  - User ID: ${identityData.UserId}"
+                            
+                            // Verify it matches the expected account
+                            if (identityData.Account != params.AWS_ACCOUNT_ID) {
+                                error("Current AWS account (${identityData.Account}) does not match expected account (${params.AWS_ACCOUNT_ID})")
+                            }
+                            
+                        } catch (Exception e) {
+                            error("Failed to verify AWS credentials: ${e.message}")
+                        }
+                    }
+                    
+                    echo ""
+                    echo "✓ AWS credentials configured successfully"
+                }
+            }
+        }
+        
+        stage('List and Filter Roles by BA Tag') {
+            steps {
+                script {
+                    echo "=========================================="
+                    echo "IAM Role Discovery - Starting"
+                    echo "=========================================="
+
+                    // Run everything in ONE sh block - avoids CPS thread handoff issues
+                    // All steps write results to files; Groovy only reads files at the end
+                    sh """
+                        #!/bin/bash
+                        set -e
+
+                        OUTPUT_DIR="${WORKSPACE}/iam-output"
+                        mkdir -p "\$OUTPUT_DIR"
+
+                        echo ""
+                        echo "=========================================="
+                        echo "STEP 1: List All IAM Roles"
+                        echo "=========================================="
+                        echo ""
+
+                        # Fetch all roles with path info
+                        roles_json=\$(aws iam list-roles \\
+                            --query 'Roles[].{Name:RoleName,Path:Path}' \\
+                            --output json)
+
+                        total_all=\$(echo "\$roles_json" | jq 'length')
+                        echo "Total IAM roles in account: \$total_all"
+
+                        # Filter out AWS service roles
+                        echo "\$roles_json" | jq -r '.[] |
+                            select(.Path | startswith("/aws-service-role/") | not) |
+                            select(.Path | startswith("/aws-reserved/") | not) |
+                            select(.Name | startswith("AWSServiceRoleFor") | not) |
+                            .Name' > "\$OUTPUT_DIR/user_roles.txt"
+
+                        user_count=\$(wc -l < "\$OUTPUT_DIR/user_roles.txt")
+                        aws_excluded=\$((total_all - user_count))
+
+                        echo "AWS Service Roles excluded : \$aws_excluded"
+                        echo "User-Created Roles         : \$user_count"
+
+                        if [ "\$user_count" -eq 0 ]; then
+                            echo "WARNING: No user-created roles found"
+                            echo "0" > "\$OUTPUT_DIR/status.txt"
+                            exit 0
+                        fi
+
+                        echo ""
+                        echo "=========================================="
+                        echo "STEP 2: Filter Roles by BA Tag"
+                        echo "=========================================="
+                        echo ""
+
+                        # Convert input BA to lowercase once
+                        ba_lower=\$(echo "${params.BA_NAME}" | tr '[:upper:]' '[:lower:]')
+                        echo "Searching for BA tag value : ${params.BA_NAME} (case-insensitive)"
+                        echo ""
+
+                        # Clear output files
+                        > "\$OUTPUT_DIR/ba_matched_roles.txt"
+
+                        processed=0
+                        total=\$user_count
+
+                        while IFS= read -r role; do
+                            processed=\$((processed + 1))
+
+                            if [ \$((processed % 50)) -eq 0 ]; then
+                                echo "Progress: \$processed / \$total roles checked..."
+                            fi
+
+                            tags=\$(aws iam list-role-tags \\
+                                --role-name "\$role" \\
+                                --output json 2>/dev/null || echo '{"Tags":[]}')
+
+                            ba_tag=\$(echo "\$tags" | jq -r '
+                                .Tags[]
+                                | select(.Key=="BA" or .Key=="BusinessApplication")
+                                | .Value' 2>/dev/null || echo "")
+
+                            if [ -n "\$ba_tag" ]; then
+                                ba_tag_lower=\$(echo "\$ba_tag" | tr '[:upper:]' '[:lower:]')
+                                if [ "\$ba_tag_lower" = "\$ba_lower" ]; then
+                                    echo "  MATCH: \$role  (tag value: \$ba_tag)"
+                                    echo "\$role" >> "\$OUTPUT_DIR/ba_matched_roles.txt"
+                                fi
+                            fi
+
+                        done < "\$OUTPUT_DIR/user_roles.txt"
+
+                        matched_count=\$(wc -l < "\$OUTPUT_DIR/ba_matched_roles.txt")
+
+                        echo ""
+                        echo "Checked \$total roles. Matched: \$matched_count"
+
+                        if [ "\$matched_count" -eq 0 ]; then
+                            echo ""
+                            echo "WARNING: No roles matched BA tag: ${params.BA_NAME}"
+                            echo "0" > "\$OUTPUT_DIR/status.txt"
+                            exit 0
+                        fi
+
+                        echo ""
+                        echo "=========================================="
+                        echo "MATCHED ROLES (\$matched_count found)"
+                        echo "=========================================="
+                        echo ""
+                        echo "The following IAM roles have BA tag '${params.BA_NAME}':"
+                        echo ""
+                        idx=1
+                        while IFS= read -r role; do
+                            echo "  \$idx. \$role"
+                            idx=\$((idx + 1))
+                        done < "\$OUTPUT_DIR/ba_matched_roles.txt"
+
+                        echo ""
+                        echo "=========================================="
+                        echo "STEP 3: Check CloudFormation Stack Tags"
+                        echo "=========================================="
+                        echo ""
+
+                        # Clear output files
+                        > "\$OUTPUT_DIR/cft_roles.txt"
+                        > "\$OUTPUT_DIR/non_cft_roles.txt"
+
+                        while IFS= read -r role; do
+
+                            tags=\$(aws iam list-role-tags \\
+                                --role-name "\$role" \\
+                                --output json 2>/dev/null || echo '{"Tags":[]}')
+
+                            cft_stack=\$(echo "\$tags" | jq -r '
+                                .Tags[]
+                                | select(
+                                    .Key=="cloudformation-stack-name" or
+                                    .Key=="aws:cloudformation:stack-name"
+                                  )
+                                | .Value' 2>/dev/null || echo "")
+
+                            if [ -n "\$cft_stack" ]; then
+                                echo "  CFT   : \$role  =>  Stack: \$cft_stack"
+                                echo "\$role|\$cft_stack" >> "\$OUTPUT_DIR/cft_roles.txt"
+                            else
+                                echo "  Manual: \$role  (no CloudFormation tag found)"
+                                echo "\$role" >> "\$OUTPUT_DIR/non_cft_roles.txt"
+                            fi
+
+                        done < "\$OUTPUT_DIR/ba_matched_roles.txt"
+
+                        cft_count=\$(wc -l < "\$OUTPUT_DIR/cft_roles.txt")
+                        non_cft_count=\$(wc -l < "\$OUTPUT_DIR/non_cft_roles.txt")
+
+                        echo ""
+                        echo "=========================================="
+                        echo "CLOUDFORMATION ANALYSIS"
+                        echo "=========================================="
+                        echo ""
+
+                        if [ "\$cft_count" -gt 0 ]; then
+                            echo "Roles created via CloudFormation (\$cft_count):"
+                            echo "------------------------------------------"
+                            idx=1
+                            while IFS='|' read -r role stack; do
+                                echo "  \$idx. \$role"
+                                echo "       Stack: \$stack"
+                                idx=\$((idx + 1))
+                            done < "\$OUTPUT_DIR/cft_roles.txt"
+                            echo ""
+                        fi
+
+                        if [ "\$non_cft_count" -gt 0 ]; then
+                            echo "Roles NOT created via CloudFormation (\$non_cft_count):"
+                            echo "------------------------------------------"
+                            idx=1
+                            while IFS= read -r role; do
+                                echo "  \$idx. \$role"
+                                idx=\$((idx + 1))
+                            done < "\$OUTPUT_DIR/non_cft_roles.txt"
+                            echo ""
+                        fi
+
+                        echo "Summary:"
+                        echo "  Total Matching Roles       : \$matched_count"
+                        echo "  Created via CloudFormation : \$cft_count"
+                        echo "  Created Manually           : \$non_cft_count"
+
+                        echo ""
+                        echo "=========================================="
+                        echo "STEP 4: Download CloudFormation Templates"
+                        echo "=========================================="
+                        echo ""
+
+                        if [ "\$cft_count" -eq 0 ]; then
+                            echo "No CFT roles found - skipping template download"
+                            echo "1" > "\$OUTPUT_DIR/status.txt"
+                            exit 0
+                        fi
+
+                        mkdir -p "\$OUTPUT_DIR/templates"
+
+                        downloaded=0
+                        failed=0
+
+                        while IFS='|' read -r role stack; do
+                            echo "Downloading template for: \$role"
+                            echo "  Stack: \$stack"
+
+                            stack_status=\$(aws cloudformation describe-stacks \\
+                                --stack-name "\$stack" \\
+                                --query 'Stacks[0].StackStatus' \\
+                                --output text 2>/dev/null || echo "NOT_FOUND")
+
+                            if [ "\$stack_status" = "NOT_FOUND" ] || [ "\$stack_status" = "None" ]; then
+                                echo "  FAILED: Stack '\$stack' not found"
+                                failed=\$((failed + 1))
+                            else
+                                echo "  Stack status: \$stack_status"
+
+                                template_raw=\$(aws cloudformation get-template \\
+                                    --stack-name "\$stack" \\
+                                    --query 'TemplateBody' \\
+                                    --output json 2>/dev/null)
+
+                                if [ \$? -eq 0 ] && [ -n "\$template_raw" ]; then
+                                    # Safe filename: replace non-alphanumeric with underscore
+                                    safe_role=\$(echo "\$role" | tr -cs '[:alnum:]' '_')
+                                    safe_stack=\$(echo "\$stack" | tr -cs '[:alnum:]' '_')
+                                    filename="\$OUTPUT_DIR/templates/cft_\${safe_stack}_\${safe_role}.json"
+
+                                    echo "\$template_raw" | jq '.' > "\$filename"
+                                    echo "  SAVED: \$filename"
+                                    downloaded=\$((downloaded + 1))
+                                else
+                                    echo "  FAILED: Could not retrieve template"
+                                    failed=\$((failed + 1))
+                                fi
+                            fi
+
+                            echo ""
+                        done < "\$OUTPUT_DIR/cft_roles.txt"
+
+                        echo "=========================================="
+                        echo "TEMPLATE DOWNLOAD SUMMARY"
+                        echo "=========================================="
+                        echo "  Downloaded : \$downloaded"
+                        echo "  Failed     : \$failed"
+                        echo ""
+
+                        if [ \$downloaded -gt 0 ]; then
+                            echo "Saved template files:"
+                            ls -1 "\$OUTPUT_DIR/templates/"
+                        fi
+
+                        echo "1" > "\$OUTPUT_DIR/status.txt"
+                        echo ""
+                        echo "All steps completed successfully"
+                    """
+
+                    // -------------------------------------------------------
+                    // Groovy only reads small result files - no heavy CPS work
+                    // -------------------------------------------------------
+                    def status = readFile("${WORKSPACE}/iam-output/status.txt").trim()
+
+                    if (status == "0") {
+                        env.ROLES_FOUND = 'false'
+                        env.ROLE_COUNT  = '0'
+                        echo "No matching roles found - pipeline will not proceed further"
+                        return
+                    }
+
+                    // Read matched roles
+                    def matchedRolesRaw = readFile("${WORKSPACE}/iam-output/ba_matched_roles.txt").trim()
+                    def matchedRoles    = matchedRolesRaw ? matchedRolesRaw.split('\n').collect { it.trim() }.findAll { it } : []
+
+                    // Read CFT roles
+                    def cftRolesRaw  = readFile("${WORKSPACE}/iam-output/cft_roles.txt").trim()
+                    def cftRolesList = cftRolesRaw ? cftRolesRaw.split('\n').collect { it.trim() }.findAll { it } : []
+
+                    // Read non-CFT roles
+                    def nonCftRaw   = readFile("${WORKSPACE}/iam-output/non_cft_roles.txt").trim()
+                    def nonCftRoles = nonCftRaw ? nonCftRaw.split('\n').collect { it.trim() }.findAll { it } : []
+
+                    // Set environment variables for downstream stages
+                    env.ROLES_FOUND         = 'true'
+                    env.ROLE_COUNT          = matchedRoles.size().toString()
+                    env.ROLE_NAMES          = matchedRoles.join(',')
+                    env.CFT_ROLE_COUNT      = cftRolesList.size().toString()
+                    env.NON_CFT_ROLE_COUNT  = nonCftRoles.size().toString()
+
+                    if (cftRolesList.size() > 0) {
+                        env.CFT_ROLE_NAMES  = cftRolesList.collect { it.split('\\|')[0] }.join(',')
+                        env.CFT_STACK_NAMES = cftRolesList.collect { it.split('\\|')[1] }.join(',')
+                    }
+
+                    echo "=========================================="
+                    echo "Environment variables set for next stages:"
+                    echo "  ROLE_COUNT     = ${env.ROLE_COUNT}"
+                    echo "  CFT_ROLE_COUNT = ${env.CFT_ROLE_COUNT}"
+                    echo "=========================================="
+                }
+            }
+        }
+        
+        stage('Test Summary') {
+            steps {
+                script {
+                    echo ""
+                    echo "=========================================="
+                    echo "TEST SUMMARY"
+                    echo "=========================================="
+                    echo ""
+                    echo "Configuration:"
+                    echo "  - BA Name: ${params.BA_NAME}"
+                    echo "  - AWS Account: ${params.AWS_ACCOUNT_ID}"
+                    
+                    if (params.ASSUME_ROLE_ARN && !params.ASSUME_ROLE_ARN.trim().isEmpty()) {
+                        echo "  - Assumed Role: ${params.ASSUME_ROLE_ARN}"
+                    } else {
+                        echo "  - Assumed Role: None (using default credentials)"
+                    }
+                    
+                    echo ""
+                    echo "Results:"
+                    echo "  - Total Roles Found: ${env.ROLE_COUNT ?: '0'}"
+                    
+                    if (env.ROLES_FOUND == 'true') {
+                        echo "  - Created via CloudFormation: ${env.CFT_ROLE_COUNT ?: '0'}"
+                        echo "  - Created Manually/Other: ${env.NON_CFT_ROLE_COUNT ?: '0'}"
+                        
+                        if (env.CFT_ROLE_COUNT != null && env.CFT_ROLE_COUNT.toInteger() > 0) {
+                            echo "  - CFT Templates Downloaded: ${env.CFT_TEMPLATES_DOWNLOADED ?: '0'}"
+                            echo "  - CFT Templates Failed: ${env.CFT_TEMPLATES_FAILED ?: '0'}"
+                        }
+                        
+                        echo "  - Role Names: ${env.ROLE_NAMES}"
+                        echo ""
+                        echo "✓ Stage 1 Testing SUCCESSFUL"
+                        echo ""
+                        echo "Next Steps:"
+                        echo "1. Verify the roles and CloudFormation info above are correct"
+                        if (env.CFT_TEMPLATES_DOWNLOADED != null && env.CFT_TEMPLATES_DOWNLOADED.toInteger() > 0) {
+                            echo "2. CloudFormation templates downloaded successfully"
+                            echo "3. Proceed to add Stage 2 (Extract Policy Names)"
+                        } else {
+                            echo "2. Proceed to add Stage 2 (Extract Policy Names)"
+                        }
+                    } else {
+                        echo ""
+                        echo "⚠ No roles found - verify your BA tag configuration"
+                        echo ""
+                        echo "Tips:"
+                        echo "- BA name comparison is case-insensitive"
+                        echo "- Check if roles have 'BA' or 'BusinessApplication' tag"
+                        echo "- Verify tag value matches (even with different case)"
+                    }
+                    
+                    echo "=========================================="
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            script {
+                echo ""
+                echo "Pipeline completed successfully!"
+                
+                if (env.ROLES_FOUND == 'true') {
+                    echo "Found ${env.ROLE_COUNT} IAM role(s) for BA: ${params.BA_NAME}"
+                    echo "CFT roles: ${env.CFT_ROLE_COUNT}  |  Manual roles: ${env.NON_CFT_ROLE_COUNT}"
+                }
+            }
+            // Archive downloaded CFT templates if any exist
+            archiveArtifacts artifacts: 'iam-output/templates/*.json',
+                             allowEmptyArchive: true,
+                             fingerprint: true
+        }
+        failure {
+            echo "Pipeline failed. Check the logs above for details."
+        }
+        always {
+            script {
+                if (params.ASSUME_ROLE_ARN && !params.ASSUME_ROLE_ARN.trim().isEmpty()) {
+                    env.AWS_ACCESS_KEY_ID     = ''
+                    env.AWS_SECRET_ACCESS_KEY = ''
+                    env.AWS_SESSION_TOKEN     = ''
+                    echo "Assumed role credentials cleared"
+                }
+            }
+        }
+    }
+}
