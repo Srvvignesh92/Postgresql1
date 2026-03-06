@@ -42,38 +42,88 @@ pipeline {
         }
 
         // ----------------------------------------------------------------
-        // STAGE 2 – Retrieve All IAM Roles
+        // STAGE 2 – Retrieve Candidate IAM Roles (pre-filtered)
+        //
+        // Roles excluded up-front to avoid unnecessary API calls:
+        //
+        //  a) Service-Linked Roles  – path starts with /aws-service-role/
+        //     These are AWS-managed, never carry customer BA tags, and there
+        //     can be dozens of them (one per integrated AWS service).
+        //
+        //  b) AWS Default / managed roles – path starts with /aws-reserved/
+        //     e.g. AWSServiceRoleFor*, OrganizationAccountAccessRole, etc.
+        //
+        //  c) Well-known AWS default role name prefixes that may sit on the
+        //     root path ("/") but are still AWS-owned:
+        //       - AWSReservedSSO_*   (SSO permission-set roles)
+        //       - AWSServiceRoleFor* (service-linked roles on root path)
+        //       - aws-controltower-* (Control Tower vended roles)
+        //       - StackSet-*         (StackSets execution roles)
+        //       - OrganizationAccountAccessRole
+        //
+        // Keeping only customer-created roles dramatically reduces the number
+        // of list-role-tags API calls in Stage 3.
         // ----------------------------------------------------------------
-        stage('Retrieve All IAM Roles') {
+        stage('Retrieve Candidate IAM Roles') {
             steps {
                 script {
-                    echo ">>> Fetching all IAM roles from AWS account..."
+                    echo ">>> Fetching IAM roles – excluding service-linked and AWS default roles..."
 
-                    // Write role names to a workspace file for use in later stages
                     sh '''
                         set -e
 
+                        # ── Step 1: fetch ALL roles with both name and path ──────
+                        # Output format per line:  <path>TAB<roleName>
                         aws iam list-roles \
-                            --query "Roles[*].RoleName" \
+                            --query "Roles[*].[Path,RoleName]" \
                             --output text \
-                        | tr '\t' '\n' \
-                        | sort \
-                        > all_iam_roles.txt
+                        > all_iam_roles_raw.txt
 
-                        ROLE_COUNT=$(wc -l < all_iam_roles.txt | tr -d ' ')
-                        echo "Total IAM roles found: ${ROLE_COUNT}"
+                        TOTAL=$(wc -l < all_iam_roles_raw.txt | tr -d ' ')
+                        echo "Total IAM roles in account : ${TOTAL}"
+
+                        # ── Step 2: exclude service-linked & AWS-reserved paths ──
+                        # Paths /aws-service-role/* and /aws-reserved/* are AWS-owned
+                        grep -v -E '^/aws-service-role/|^/aws-reserved/' \
+                            all_iam_roles_raw.txt \
+                        > path_filtered_roles.txt
+
+                        PATH_FILTERED=$(wc -l < path_filtered_roles.txt | tr -d ' ')
+                        echo "After path filter (removed SLRs & reserved): ${PATH_FILTERED}"
+
+                        # ── Step 3: exclude well-known AWS default name prefixes ──
+                        # Extract only the role name column (field 2) then drop
+                        # names that match known AWS-managed naming conventions.
+                        awk '{print $2}' path_filtered_roles.txt \
+                        | grep -v -E \
+                            '^AWSReservedSSO_|^AWSServiceRoleFor|^aws-controltower-|^StackSet-|^OrganizationAccountAccessRole' \
+                        | sort \
+                        > candidate_iam_roles.txt
+
+                        CANDIDATE=$(wc -l < candidate_iam_roles.txt | tr -d ' ')
+                        SKIPPED=$(( TOTAL - CANDIDATE ))
+                        echo "Candidate roles to scan    : ${CANDIDATE}"
+                        echo "Roles skipped (pre-filter) : ${SKIPPED}"
+
+                        # clean up intermediate file
+                        rm -f all_iam_roles_raw.txt path_filtered_roles.txt
                     '''
                 }
             }
         }
 
         // ----------------------------------------------------------------
-        // STAGE 3 – Filter IAM Roles by BA Tag
+        // STAGE 3 – Filter Candidate Roles by BA Tag
+        //
+        // Iterates only the pre-filtered candidate list from Stage 2.
+        // A lightweight inline guard provides a second line of defence:
+        // any role whose name still matches a known AWS-managed pattern
+        // is skipped with a log line before an API call is made.
         // ----------------------------------------------------------------
         stage('Filter IAM Roles by BA Tag') {
             steps {
                 script {
-                    echo ">>> Scanning IAM roles for BA tag = '${env.BA_LOWER}' ..."
+                    echo ">>> Scanning candidate IAM roles for BA tag = '${env.BA_LOWER}' ..."
 
                     sh '''
                         set -e
@@ -82,10 +132,28 @@ pipeline {
 
                         > matched_iam_roles.txt   # clear/create output file
 
+                        SCANNED=0
+                        SKIPPED=0
+
                         while IFS= read -r ROLE_NAME; do
                             [ -z "$ROLE_NAME" ] && continue
 
-                            # Fetch tags for this role
+                            # ── Inline safety-net skip (second line of defence) ──
+                            # Catches any edge-case AWS-managed role that slipped
+                            # through the path filter (e.g. on a non-standard path).
+                            case "$ROLE_NAME" in
+                                AWSReservedSSO_*       | \
+                                AWSServiceRoleFor*     | \
+                                aws-controltower-*     | \
+                                StackSet-*             | \
+                                OrganizationAccountAccessRole)
+                                    echo "  [SKIP] AWS-managed role, no BA tag expected: $ROLE_NAME"
+                                    SKIPPED=$(( SKIPPED + 1 ))
+                                    continue
+                                    ;;
+                            esac
+
+                            # ── Fetch BA tag and compare ─────────────────────────
                             TAGS=$(aws iam list-role-tags \
                                        --role-name "$ROLE_NAME" \
                                        --query "Tags[?Key=='BA'].Value" \
@@ -94,13 +162,19 @@ pipeline {
                             # Normalise fetched tag value to lowercase for comparison
                             TAGS_LOWER=$(echo "$TAGS" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
 
+                            SCANNED=$(( SCANNED + 1 ))
+
                             if [ "$TAGS_LOWER" = "$BA_LOWER_SH" ]; then
+                                echo "  [MATCH] $ROLE_NAME"
                                 echo "$ROLE_NAME" >> matched_iam_roles.txt
                             fi
-                        done < all_iam_roles.txt
+                        done < candidate_iam_roles.txt
 
                         MATCH_COUNT=$(wc -l < matched_iam_roles.txt | tr -d ' ')
-                        echo "IAM roles matching BA='${BA_LOWER_SH}': ${MATCH_COUNT}"
+                        echo ""
+                        echo "Roles scanned via API      : ${SCANNED}"
+                        echo "Roles skipped (inline guard): ${SKIPPED}"
+                        echo "Roles matching BA tag      : ${MATCH_COUNT}"
                     '''
                 }
             }
@@ -275,7 +349,7 @@ pipeline {
         always {
             echo ">>> Cleaning up temporary workspace files..."
             sh '''
-                rm -f all_iam_roles.txt \
+                rm -f candidate_iam_roles.txt \
                       matched_iam_roles.txt \
                       cfn_iam_roles.txt \
                       non_cfn_iam_roles.txt \
