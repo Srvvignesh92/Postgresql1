@@ -1,0 +1,292 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            name: 'BA_VALUE',
+            defaultValue: '',
+            description: 'Business Application (BA) tag value to search for across AWS resources'
+        )
+    }
+
+    environment {
+        BA_LOWER = ''
+    }
+
+    options {
+        timestamps()
+        ansiColor('xterm')
+    }
+
+    stages {
+
+        // ----------------------------------------------------------------
+        // STAGE 1 – Validate & Normalise Input
+        // ----------------------------------------------------------------
+        stage('Validate and Normalize BA Input') {
+            steps {
+                script {
+                    if (!params.BA_VALUE?.trim()) {
+                        error("BA_VALUE parameter is empty. Please provide a valid Business Application tag value.")
+                    }
+
+                    // Convert to lowercase – BA tag is case-sensitive in AWS
+                    env.BA_LOWER = params.BA_VALUE.trim().toLowerCase()
+
+                    echo "============================================"
+                    echo "  Input BA value   : ${params.BA_VALUE}"
+                    echo "  Normalized value  : ${env.BA_LOWER}"
+                    echo "============================================"
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // STAGE 2 – Retrieve All IAM Roles
+        // ----------------------------------------------------------------
+        stage('Retrieve All IAM Roles') {
+            steps {
+                script {
+                    echo ">>> Fetching all IAM roles from AWS account..."
+
+                    // Write role names to a workspace file for use in later stages
+                    sh '''
+                        set -e
+
+                        aws iam list-roles \
+                            --query "Roles[*].RoleName" \
+                            --output text \
+                        | tr '\t' '\n' \
+                        | sort \
+                        > all_iam_roles.txt
+
+                        ROLE_COUNT=$(wc -l < all_iam_roles.txt | tr -d ' ')
+                        echo "Total IAM roles found: ${ROLE_COUNT}"
+                    '''
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // STAGE 3 – Filter IAM Roles by BA Tag
+        // ----------------------------------------------------------------
+        stage('Filter IAM Roles by BA Tag') {
+            steps {
+                script {
+                    echo ">>> Scanning IAM roles for BA tag = '${env.BA_LOWER}' ..."
+
+                    sh '''
+                        set -e
+
+                        BA_LOWER_SH="''' + env.BA_LOWER + '''"
+
+                        > matched_iam_roles.txt   # clear/create output file
+
+                        while IFS= read -r ROLE_NAME; do
+                            [ -z "$ROLE_NAME" ] && continue
+
+                            # Fetch tags for this role
+                            TAGS=$(aws iam list-role-tags \
+                                       --role-name "$ROLE_NAME" \
+                                       --query "Tags[?Key=='BA'].Value" \
+                                       --output text 2>/dev/null || true)
+
+                            # Normalise fetched tag value to lowercase for comparison
+                            TAGS_LOWER=$(echo "$TAGS" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+
+                            if [ "$TAGS_LOWER" = "$BA_LOWER_SH" ]; then
+                                echo "$ROLE_NAME" >> matched_iam_roles.txt
+                            fi
+                        done < all_iam_roles.txt
+
+                        MATCH_COUNT=$(wc -l < matched_iam_roles.txt | tr -d ' ')
+                        echo "IAM roles matching BA='${BA_LOWER_SH}': ${MATCH_COUNT}"
+                    '''
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // STAGE 4 – Classify Matched Roles (CloudFormation vs Non-CFN)
+        // ----------------------------------------------------------------
+        stage('Classify IAM Roles by CloudFormation Ownership') {
+            steps {
+                script {
+                    echo ">>> Classifying matched IAM roles by CloudFormation ownership..."
+
+                    sh '''
+                        set -e
+
+                        > cfn_iam_roles.txt      # roles managed by CloudFormation
+                        > non_cfn_iam_roles.txt  # roles NOT managed by CloudFormation
+
+                        while IFS= read -r ROLE_NAME; do
+                            [ -z "$ROLE_NAME" ] && continue
+
+                            # Fetch all tag keys for this role
+                            TAG_KEYS=$(aws iam list-role-tags \
+                                           --role-name "$ROLE_NAME" \
+                                           --query "Tags[*].Key" \
+                                           --output text 2>/dev/null || true)
+
+                            IS_CFN="false"
+
+                            # CloudFormation stamps roles with these well-known tag keys
+                            for KEY in $TAG_KEYS; do
+                                KEY_LOWER=$(echo "$KEY" | tr '[:upper:]' '[:lower:]')
+                                case "$KEY_LOWER" in
+                                    aws:cloudformation:stack-name | \
+                                    aws:cloudformation:stack-id   | \
+                                    aws:cloudformation:logical-id | \
+                                    cloudformation:stack-name     | \
+                                    cft:stack-name                | \
+                                    cft-stack-name                | \
+                                    cft_stack_name)
+                                        IS_CFN="true"
+                                        break
+                                        ;;
+                                esac
+                            done
+
+                            if [ "$IS_CFN" = "true" ]; then
+                                echo "$ROLE_NAME" >> cfn_iam_roles.txt
+                            else
+                                echo "$ROLE_NAME" >> non_cfn_iam_roles.txt
+                            fi
+                        done < matched_iam_roles.txt
+
+                        echo "Roles managed by CloudFormation   : $(wc -l < cfn_iam_roles.txt    | tr -d ' ')"
+                        echo "Roles NOT managed by CloudFormation: $(wc -l < non_cfn_iam_roles.txt | tr -d ' ')"
+                    '''
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // STAGE 5 – Retrieve & Filter Security Groups by BA Tag
+        // ----------------------------------------------------------------
+        stage('Retrieve Security Groups by BA Tag') {
+            steps {
+                script {
+                    echo ">>> Fetching security groups with BA tag = '${env.BA_LOWER}' ..."
+
+                    sh '''
+                        set -e
+
+                        BA_LOWER_SH="''' + env.BA_LOWER + '''"
+
+                        # Use AWS tag filter directly – more efficient than looping
+                        aws ec2 describe-security-groups \
+                            --filters \
+                                "Name=tag-key,Values=BA" \
+                                "Name=tag-value,Values=${BA_LOWER_SH}" \
+                            --query "SecurityGroups[*].[GroupId,GroupName,Description]" \
+                            --output text \
+                        > matched_security_groups.txt
+
+                        SG_COUNT=$(wc -l < matched_security_groups.txt | tr -d ' ')
+                        echo "Security groups matching BA='${BA_LOWER_SH}': ${SG_COUNT}"
+                    '''
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // STAGE 6 – Print Summary Report
+        // ----------------------------------------------------------------
+        stage('Print Summary Report') {
+            steps {
+                script {
+                    sh '''
+                        echo ""
+                        echo "########################################################"
+                        echo "#           AWS Resource Discovery Summary             #"
+                        echo "########################################################"
+                        echo ""
+                        echo "  Business Application (BA) tag value : ''' + env.BA_LOWER + '''"
+                        echo ""
+
+                        # ── Matched IAM Roles ───────────────────────────────────
+                        echo "------------------------------------------------------------"
+                        echo "  IAM Roles matching BA tag ($(wc -l < matched_iam_roles.txt | tr -d ' ') found)"
+                        echo "------------------------------------------------------------"
+                        if [ -s matched_iam_roles.txt ]; then
+                            while IFS= read -r ROLE; do
+                                echo "    - $ROLE"
+                            done < matched_iam_roles.txt
+                        else
+                            echo "    (none)"
+                        fi
+                        echo ""
+
+                        # ── CFN-Managed Roles ────────────────────────────────────
+                        echo "------------------------------------------------------------"
+                        echo "  IAM Roles managed by CloudFormation ($(wc -l < cfn_iam_roles.txt | tr -d ' ') found)"
+                        echo "------------------------------------------------------------"
+                        if [ -s cfn_iam_roles.txt ]; then
+                            while IFS= read -r ROLE; do
+                                echo "    - $ROLE"
+                            done < cfn_iam_roles.txt
+                        else
+                            echo "    (none)"
+                        fi
+                        echo ""
+
+                        # ── Non-CFN Roles ────────────────────────────────────────
+                        echo "------------------------------------------------------------"
+                        echo "  IAM Roles NOT managed by CloudFormation ($(wc -l < non_cfn_iam_roles.txt | tr -d ' ') found)"
+                        echo "------------------------------------------------------------"
+                        if [ -s non_cfn_iam_roles.txt ]; then
+                            while IFS= read -r ROLE; do
+                                echo "    - $ROLE"
+                            done < non_cfn_iam_roles.txt
+                        else
+                            echo "    (none)"
+                        fi
+                        echo ""
+
+                        # ── Security Groups ──────────────────────────────────────
+                        echo "------------------------------------------------------------"
+                        echo "  Security Groups matching BA tag ($(wc -l < matched_security_groups.txt | tr -d ' ') found)"
+                        echo "  Format: GroupId   GroupName   Description"
+                        echo "------------------------------------------------------------"
+                        if [ -s matched_security_groups.txt ]; then
+                            while IFS= read -r SG_LINE; do
+                                echo "    - $SG_LINE"
+                            done < matched_security_groups.txt
+                        else
+                            echo "    (none)"
+                        fi
+                        echo ""
+                        echo "########################################################"
+                        echo "#                   End of Report                      #"
+                        echo "########################################################"
+                        echo ""
+                    '''
+                }
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Post Actions
+    // ----------------------------------------------------------------
+    post {
+        always {
+            echo ">>> Cleaning up temporary workspace files..."
+            sh '''
+                rm -f all_iam_roles.txt \
+                      matched_iam_roles.txt \
+                      cfn_iam_roles.txt \
+                      non_cfn_iam_roles.txt \
+                      matched_security_groups.txt
+            '''
+        }
+        success {
+            echo "Pipeline completed successfully. Check the Summary Report stage for results."
+        }
+        failure {
+            echo "Pipeline FAILED. Review the stage logs above to identify the root cause."
+        }
+    }
+}
