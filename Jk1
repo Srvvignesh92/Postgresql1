@@ -962,3 +962,407 @@ pipeline {
         }
     }
 }
+
+====
+
+
+
+
+
+
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            name: 'BA_VALUE',
+            defaultValue: '',
+            description: 'Business Application (BA) tag value to search for across AWS resources'
+        )
+    }
+
+    environment {
+        BA_LOWER = ''
+    }
+
+    options {
+        timestamps()
+        ansiColor('xterm')
+    }
+
+    stages {
+
+        // ----------------------------------------------------------------
+        // STAGE 1 – Validate & Normalise Input
+        // ----------------------------------------------------------------
+        stage('Validate and Normalize BA Input') {
+            steps {
+                script {
+                    if (!params.BA_VALUE?.trim()) {
+                        error("BA_VALUE parameter is empty. Please provide a valid Business Application tag value.")
+                    }
+
+                    env.BA_LOWER = params.BA_VALUE.trim().toLowerCase()
+
+                    echo "Input BA value  : ${params.BA_VALUE}"
+                    echo "Normalized value: ${env.BA_LOWER}"
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // STAGE 2 – Retrieve Candidate IAM Roles (pre-filtered)
+        //
+        // Excluded role categories (zero BA tags expected on any of these):
+        //
+        //  PATH-based exclusions (caught by a single grep on the IAM path):
+        //    /aws-service-role/*  – every AWS service-linked role
+        //    /aws-reserved/*      – AWS-reserved system roles
+        //
+        //  NAME-based exclusions (roles that land on the root "/" path
+        //  but are still AWS-owned or AWS-generated):
+        //    AWS*                 – all AWS-prefixed managed/custom roles
+        //                           (AWSServiceRoleFor*, AWSReservedSSO_*,
+        //                            AWSBackup*, AWSGlue*, AWSConfig*, etc.)
+        //    aws-*                – lowercase aws- prefix roles
+        //                           (aws-controltower-*, aws-quicksight-*, etc.)
+        //    StackSet-*           – CloudFormation StackSets execution roles
+        //    OrganizationAccount* – AWS Organizations access role
+        //    cdk-*                – AWS CDK bootstrap roles
+        // ----------------------------------------------------------------
+        stage('Retrieve Candidate IAM Roles') {
+            steps {
+                script {
+                    echo "Fetching IAM roles and applying pre-filter..."
+
+                    sh '''
+                        set -e
+
+                        # Fetch all roles: Path and RoleName columns
+                        aws iam list-roles \
+                            --query "Roles[*].[Path,RoleName]" \
+                            --output text \
+                        > all_iam_roles_raw.txt
+
+                        TOTAL=$(wc -l < all_iam_roles_raw.txt | tr -d ' ')
+
+                        # Step 1 – drop roles on AWS-owned paths
+                        grep -v -E '^/aws-service-role/|^/aws-reserved/' \
+                            all_iam_roles_raw.txt \
+                        > path_filtered_roles.txt
+
+                        # Step 2 – drop all AWS-managed / AWS-generated name prefixes.
+                        #   ^AWS  catches every AWS* role (service-linked, SSO,
+                        #         Config, Backup, Glue, custom AWS-prefixed roles, etc.)
+                        #   ^aws- catches lowercase-prefixed AWS roles
+                        awk '{print $2}' path_filtered_roles.txt \
+                        | grep -v -E \
+                            '^AWS|^aws-|^StackSet-|^OrganizationAccount|^cdk-' \
+                        | sort \
+                        > candidate_iam_roles.txt
+
+                        CANDIDATE=$(wc -l < candidate_iam_roles.txt | tr -d ' ')
+                        SKIPPED=$(( TOTAL - CANDIDATE ))
+
+                        echo "Total roles in account : ${TOTAL}"
+                        echo "Roles skipped (noise)  : ${SKIPPED}"
+                        echo "Candidate roles to scan: ${CANDIDATE}"
+
+                        rm -f all_iam_roles_raw.txt path_filtered_roles.txt
+                    '''
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // STAGE 3 – Filter Candidate Roles by BA Tag
+        // ----------------------------------------------------------------
+        stage('Filter IAM Roles by BA Tag') {
+            steps {
+                script {
+                    echo "Scanning candidate roles for BA tag = '${env.BA_LOWER}' ..."
+
+                    sh '''
+                        set -e
+
+                        BA_LOWER_SH="''' + env.BA_LOWER + '''"
+
+                        > matched_iam_roles.txt
+
+                        SCANNED=0
+
+                        while IFS= read -r ROLE_NAME; do
+                            [ -z "$ROLE_NAME" ] && continue
+
+                            TAGS=$(aws iam list-role-tags \
+                                       --role-name "$ROLE_NAME" \
+                                       --query "Tags[?Key=='BA'].Value" \
+                                       --output text 2>/dev/null || true)
+
+                            TAGS_LOWER=$(echo "$TAGS" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+                            SCANNED=$(( SCANNED + 1 ))
+
+                            if [ "$TAGS_LOWER" = "$BA_LOWER_SH" ]; then
+                                echo "$ROLE_NAME" >> matched_iam_roles.txt
+                            fi
+                        done < candidate_iam_roles.txt
+
+                        MATCH_COUNT=$(wc -l < matched_iam_roles.txt | tr -d ' ')
+                        echo "Roles scanned: ${SCANNED}"
+                        echo "Roles matched: ${MATCH_COUNT}"
+                    '''
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // STAGE 4 – Classify Matched Roles by CloudFormation Ownership
+        //
+        // CFT tag keys recognised (checked case-insensitively):
+        //
+        //   Native AWS tags  : aws:cloudformation:stack-name   ← set by CFN automatically
+        //                      aws:cloudformation:stack-id
+        //                      aws:cloudformation:logical-id
+        //
+        //   Custom / org tags: cloudformation-stack-name       ← your org's primary convention
+        //                      cloudformation:stack-name
+        //                      cft:stack-name
+        //                      cft-stack-name
+        //                      cft_stack_name
+        //
+        // When a CFT tag is found its VALUE (the stack name) is captured and
+        // stored alongside the role name as: "<RoleName>|<StackName>"
+        // ----------------------------------------------------------------
+        stage('Classify IAM Roles by CloudFormation Ownership') {
+            steps {
+                script {
+                    echo "Classifying matched roles by CloudFormation ownership..."
+
+                    sh '''
+                        set -e
+
+                        > cfn_iam_roles.txt
+                        > non_cfn_iam_roles.txt
+
+                        while IFS= read -r ROLE_NAME; do
+                            [ -z "$ROLE_NAME" ] && continue
+
+                            # Fetch every tag as "Key<TAB>Value" lines
+                            # and write to a temp file to avoid heredoc syntax issues
+                            aws iam list-role-tags \
+                                --role-name "$ROLE_NAME" \
+                                --query "Tags[*].[Key,Value]" \
+                                --output text 2>/dev/null \
+                            > role_tags_tmp.txt || true
+
+                            CFT_STACK_NAME=""
+
+                            while IFS= read -r TAG_LINE; do
+                                [ -z "$TAG_LINE" ] && continue
+
+                                TAG_KEY=$(echo "$TAG_LINE"  | awk '{print $1}')
+                                TAG_VAL=$(echo "$TAG_LINE"  | awk '{$1=""; print $0}' | xargs)
+                                KEY_LOWER=$(echo "$TAG_KEY" | tr '[:upper:]' '[:lower:]')
+
+                                case "$KEY_LOWER" in
+                                    aws:cloudformation:stack-name | \
+                                    aws:cloudformation:stack-id   | \
+                                    aws:cloudformation:logical-id | \
+                                    cloudformation-stack-name     | \
+                                    cloudformation:stack-name     | \
+                                    cft:stack-name                | \
+                                    cft-stack-name                | \
+                                    cft_stack_name)
+                                        CFT_STACK_NAME="$TAG_VAL"
+                                        break
+                                        ;;
+                                esac
+                            done < role_tags_tmp.txt
+
+                            if [ -n "$CFT_STACK_NAME" ]; then
+                                echo "${ROLE_NAME}|${CFT_STACK_NAME}" >> cfn_iam_roles.txt
+                            else
+                                echo "$ROLE_NAME" >> non_cfn_iam_roles.txt
+                            fi
+                        done < matched_iam_roles.txt
+
+                        rm -f role_tags_tmp.txt
+
+                        echo "CFN-managed roles: $(wc -l < cfn_iam_roles.txt     | tr -d ' ')"
+                        echo "Non-CFN roles    : $(wc -l < non_cfn_iam_roles.txt | tr -d ' ')"
+                    '''
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // STAGE 5 – Collect Role Last Used Details
+        //
+        // Uses: aws iam get-role --role-name <name>
+        //   → RoleLastUsed.LastUsedDate  – timestamp of last API activity
+        //   → RoleLastUsed.Region        – AWS region where it was last used
+        //
+        // Single synchronous call per role, no async polling needed.
+        // Roles never used return an empty RoleLastUsed block; those are
+        // normalised to "Never" / "N/A" so the report always has a value.
+        //
+        // Output files are rebuilt with extra pipe-delimited columns:
+        //   cfn_iam_roles.txt     → <RoleName>|<StackName>|<LastUsedDate>|<Region>
+        //   non_cfn_iam_roles.txt → <RoleName>|<LastUsedDate>|<Region>
+        // ----------------------------------------------------------------
+        stage('Collect Role Last Used Details') {
+            steps {
+                script {
+                    echo "Fetching last used details for all matched roles..."
+
+                    sh '''
+                        set -e
+
+                        > cfn_iam_roles_tmp.txt
+                        > non_cfn_iam_roles_tmp.txt
+
+                        # ── CFN-managed roles ────────────────────────────────────
+                        while IFS='|' read -r ROLE STACK; do
+                            [ -z "$ROLE" ] && continue
+
+                            LAST_DATE=$(aws iam get-role \
+                                            --role-name "$ROLE" \
+                                            --query "Role.RoleLastUsed.LastUsedDate" \
+                                            --output text 2>/dev/null || true)
+
+                            LAST_REGION=$(aws iam get-role \
+                                              --role-name "$ROLE" \
+                                              --query "Role.RoleLastUsed.Region" \
+                                              --output text 2>/dev/null || true)
+
+                            # Normalise empty / "None" AWS responses
+                            [ -z "$LAST_DATE"   ] || [ "$LAST_DATE"   = "None" ] && LAST_DATE="Never"
+                            [ -z "$LAST_REGION" ] || [ "$LAST_REGION" = "None" ] && LAST_REGION="N/A"
+
+                            echo "${ROLE}|${STACK}|${LAST_DATE}|${LAST_REGION}" >> cfn_iam_roles_tmp.txt
+                        done < cfn_iam_roles.txt
+
+                        # ── Non-CFN roles ─────────────────────────────────────
+                        while IFS= read -r ROLE; do
+                            [ -z "$ROLE" ] && continue
+
+                            LAST_DATE=$(aws iam get-role \
+                                            --role-name "$ROLE" \
+                                            --query "Role.RoleLastUsed.LastUsedDate" \
+                                            --output text 2>/dev/null || true)
+
+                            LAST_REGION=$(aws iam get-role \
+                                              --role-name "$ROLE" \
+                                              --query "Role.RoleLastUsed.Region" \
+                                              --output text 2>/dev/null || true)
+
+                            [ -z "$LAST_DATE"   ] || [ "$LAST_DATE"   = "None" ] && LAST_DATE="Never"
+                            [ -z "$LAST_REGION" ] || [ "$LAST_REGION" = "None" ] && LAST_REGION="N/A"
+
+                            echo "${ROLE}|${LAST_DATE}|${LAST_REGION}" >> non_cfn_iam_roles_tmp.txt
+                        done < non_cfn_iam_roles.txt
+
+                        # Replace originals with enriched versions
+                        mv cfn_iam_roles_tmp.txt     cfn_iam_roles.txt
+                        mv non_cfn_iam_roles_tmp.txt non_cfn_iam_roles.txt
+
+                        echo "Last used details collected for $(wc -l < matched_iam_roles.txt | tr -d ' ') roles"
+                    '''
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // STAGE 6 – Print Final Report
+        //
+        // CFN roles    → Role Name | CFT Stack | Last Used | Region
+        // Non-CFN roles→ Role Name | Last Used | Region
+        // ----------------------------------------------------------------
+        stage('Print Final Report') {
+            steps {
+                script {
+                    sh '''
+                        BA_LOWER_SH="''' + env.BA_LOWER + '''"
+
+                        TOTAL_MATCHED=$(wc -l < matched_iam_roles.txt     | tr -d ' ')
+                        TOTAL_CFN=$(wc -l     < cfn_iam_roles.txt         | tr -d ' ')
+                        TOTAL_NON_CFN=$(wc -l < non_cfn_iam_roles.txt     | tr -d ' ')
+
+                        echo ""
+                        echo "================================================================"
+                        echo "  IAM Role Discovery  |  BA = ${BA_LOWER_SH}"
+                        echo "  Total matched: ${TOTAL_MATCHED}  |  CFN: ${TOTAL_CFN}  |  Non-CFN: ${TOTAL_NON_CFN}"
+                        echo "================================================================"
+                        echo ""
+
+                        # ── CloudFormation-Managed Roles ─────────────────────────
+                        echo "  CloudFormation-Managed Roles"
+                        echo "  ----------------------------------------------------------------"
+                        if [ -s cfn_iam_roles.txt ]; then
+                            printf "  %-50s  %-35s  %-26s  %s\\n" \
+                                "Role Name" "CFT Stack" "Last Used" "Region"
+                            printf "  %-50s  %-35s  %-26s  %s\\n" \
+                                "--------------------------------------------------" \
+                                "-----------------------------------" \
+                                "--------------------------" \
+                                "---------------"
+                            while IFS='|' read -r ROLE STACK LAST_DATE LAST_REGION; do
+                                printf "  %-50s  %-35s  %-26s  %s\\n" \
+                                    "$ROLE" "$STACK" "$LAST_DATE" "$LAST_REGION"
+                            done < cfn_iam_roles.txt
+                        else
+                            echo "  (none)"
+                        fi
+
+                        echo ""
+
+                        # ── Non-CloudFormation Roles ─────────────────────────────
+                        echo "  Non-CloudFormation Roles"
+                        echo "  ----------------------------------------------------------------"
+                        if [ -s non_cfn_iam_roles.txt ]; then
+                            printf "  %-50s  %-26s  %s\\n" \
+                                "Role Name" "Last Used" "Region"
+                            printf "  %-50s  %-26s  %s\\n" \
+                                "--------------------------------------------------" \
+                                "--------------------------" \
+                                "---------------"
+                            while IFS='|' read -r ROLE LAST_DATE LAST_REGION; do
+                                printf "  %-50s  %-26s  %s\\n" \
+                                    "$ROLE" "$LAST_DATE" "$LAST_REGION"
+                            done < non_cfn_iam_roles.txt
+                        else
+                            echo "  (none)"
+                        fi
+
+                        echo ""
+                        echo "================================================================"
+                        echo ""
+                    '''
+                }
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Post Actions
+    // ----------------------------------------------------------------
+    post {
+        always {
+            sh '''
+                rm -f candidate_iam_roles.txt \
+                      matched_iam_roles.txt    \
+                      cfn_iam_roles.txt        \
+                      non_cfn_iam_roles.txt    \
+                      role_tags_tmp.txt
+            '''
+        }
+        success {
+            echo "Pipeline completed successfully."
+        }
+        failure {
+            echo "Pipeline FAILED. Review the stage logs above to identify the root cause."
+        }
+    }
+}
+
+==
